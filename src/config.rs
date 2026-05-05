@@ -16,6 +16,12 @@ pub struct ChainConfig {
     pub jack_client_prefix: String,
     /// JACK buffer size override passed to every `jalv` instance (`-b` flag).
     pub buffer_size: Option<u32>,
+    /// Connect first plugin's audio input from system capture (microphone).
+    #[serde(default)]
+    pub auto_connect_input: bool,
+    /// Connect last plugin's audio output to system playback (speakers).
+    #[serde(default)]
+    pub auto_connect_output: bool,
 }
 
 /// Configuration for a single LV2 plugin instance.

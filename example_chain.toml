@@ -1,4 +1,6 @@
 jack_client_prefix = "bn"
+auto_connect_output = true
+# auto_connect_input = true  # wire system capture → first plugin
 
 [[plugins]]
 uri = "http://calf.sourceforge.net/plugins/Equalizer5Band"
