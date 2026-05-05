@@ -8,8 +8,18 @@ use crate::error::Error;
 use crate::jalv::JalvInstance;
 use crate::midi::{self, MidiRouter, MidiSender};
 
+/// Per-plugin ring buffer capacity for queued MIDI events.
 const MIDI_RING_CAPACITY: usize = 1024;
 
+/// A running chain of LV2 plugins wired in series.
+///
+/// Each plugin runs as a separate `jalv` process. Audio ports are connected
+/// left-to-right via `pw-link`. If any plugin exposes MIDI input, a dedicated
+/// JACK client is created to route [`MidiEvent`](crate::MidiEvent)s from
+/// user code into the corresponding plugin.
+///
+/// Drop or call [`Chain::stop`] to tear down all child processes and JACK
+/// connections.
 pub struct Chain {
     instances: Vec<JalvInstance>,
     midi_router: Option<MidiRouter>,
@@ -17,6 +27,10 @@ pub struct Chain {
 }
 
 impl Chain {
+    /// Spawn all plugins, wire audio ports in series, and set up MIDI routing.
+    ///
+    /// Blocks briefly (~700 ms) while jalv processes register their JACK ports.
+    /// Returns an error if any plugin fails to spawn or wiring fails.
     pub fn start(config: &ChainConfig) -> Result<Self, Error> {
         if config.plugins.is_empty() {
             return Err(Error::Config("chain has no plugins".into()));
@@ -43,9 +57,12 @@ impl Chain {
         let mut midi_senders = HashMap::new();
         let mut midi_ports = Vec::new();
 
-        for instance in &instances {
+        for (instance, plugin_cfg) in instances.iter().zip(&config.plugins) {
             let name = instance.jack_client_name();
-            if has_midi_input(name) {
+            let wants_midi = plugin_cfg
+                .midi_in
+                .unwrap_or_else(|| has_midi_input(name));
+            if wants_midi {
                 let (sender, port) = midi::create_midi_channel(name, MIDI_RING_CAPACITY);
                 midi_senders.insert(name.to_string(), sender);
                 midi_ports.push(port);
@@ -77,6 +94,10 @@ impl Chain {
         })
     }
 
+    /// Set a control port value on a running plugin.
+    ///
+    /// `plugin_name` must match [`PluginConfig::name`](crate::PluginConfig::name).
+    /// `port` is the LV2 port symbol (e.g. `"threshold"`).
     pub fn set_control(
         &mut self,
         plugin_name: &str,
@@ -93,6 +114,10 @@ impl Chain {
         instance.set_control(port, value)
     }
 
+    /// Get a [`MidiSender`] for pushing MIDI events to the named plugin.
+    ///
+    /// Returns [`Error::PluginNotFound`] if the plugin has no MIDI input or
+    /// doesn't exist.
     pub fn midi_sender(&mut self, plugin_name: &str) -> Result<&mut MidiSender, Error> {
         self.midi_senders
             .get_mut(plugin_name)
@@ -101,6 +126,20 @@ impl Chain {
             })
     }
 
+    /// Get the [`MidiSender`] when exactly one plugin in the chain accepts MIDI.
+    ///
+    /// Returns [`Error::AmbiguousMidi`] if zero or more than one plugin has
+    /// MIDI input.
+    pub fn sole_midi_sender(&mut self) -> Result<&mut MidiSender, Error> {
+        if self.midi_senders.len() != 1 {
+            return Err(Error::AmbiguousMidi {
+                count: self.midi_senders.len(),
+            });
+        }
+        Ok(self.midi_senders.values_mut().next().unwrap())
+    }
+
+    /// Tear down the chain: drop MIDI resources, kill all jalv processes.
     pub fn stop(&mut self) {
         self.midi_senders.clear();
         drop(self.midi_router.take());
@@ -110,10 +149,12 @@ impl Chain {
         self.instances.clear();
     }
 
+    /// Returns `true` if every plugin in the chain is still alive.
     pub fn is_running(&mut self) -> bool {
         self.instances.iter_mut().all(|i| i.is_running())
     }
 
+    /// JACK port names for the first plugin's stereo audio input (`in_l`, `in_r`).
     pub fn chain_input_ports(&self) -> Option<(String, String)> {
         self.instances.first().map(|i| {
             let name = i.jack_client_name();
@@ -121,6 +162,7 @@ impl Chain {
         })
     }
 
+    /// JACK port names for the last plugin's stereo audio output (`out_l`, `out_r`).
     pub fn chain_output_ports(&self) -> Option<(String, String)> {
         self.instances.last().map(|i| {
             let name = i.jack_client_name();
@@ -135,6 +177,7 @@ impl Drop for Chain {
     }
 }
 
+/// Wire audio output ports of `from` to audio input ports of `to` via `pw-link`.
 fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
     let out_ports = get_ports(from, PortDirection::Output)?;
     let in_ports = get_ports(to, PortDirection::Input)?;
@@ -162,6 +205,8 @@ enum PortDirection {
     Input,
 }
 
+/// List JACK ports for `client` using `pw-link`. Retries up to 10 times
+/// (200 ms apart) while the client is still registering ports.
 fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Error> {
     let flag = match direction {
         PortDirection::Output => "-o",
@@ -191,6 +236,7 @@ fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Erro
     }
 }
 
+/// Create a single PipeWire link between two JACK ports.
 fn pw_link(from: &str, to: &str) -> Result<(), Error> {
     let output = Command::new("pw-link")
         .arg(from)
@@ -219,25 +265,52 @@ fn is_midi_port(port: &str) -> bool {
     lower.contains("midi") || lower.contains("event")
 }
 
+/// Check if `client` has any MIDI input ports via JACK API (queries port type,
+/// not name — works for plugins like DrumGizmo that name their MIDI port
+/// `control`).
 fn has_midi_input(client: &str) -> bool {
+    let probe = jack::Client::new("bn-probe", jack::ClientOptions::NO_START_SERVER);
+    let (jc, _) = match probe {
+        Ok(c) => c,
+        Err(_) => {
+            log::warn!("JACK probe failed, falling back to port-name heuristic for {client}");
+            return has_midi_input_heuristic(client);
+        }
+    };
+    let prefix = format!("{client}:");
+    let midi_ins = jc.ports(
+        None,
+        Some("8 bit raw midi"),
+        jack::PortFlags::IS_INPUT,
+    );
+    midi_ins.iter().any(|p| p.starts_with(&prefix))
+}
+
+fn has_midi_input_heuristic(client: &str) -> bool {
     get_ports(client, PortDirection::Input)
         .map(|ports| ports.iter().any(|p| is_midi_port(p)))
         .unwrap_or(false)
 }
 
+/// Wire the MIDI router's output port for `target_client` to the target's
+/// first MIDI input port. Uses JACK API to identify MIDI ports by type rather
+/// than name.
 fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
-    let out_ports = get_ports(router_client, PortDirection::Output)?;
-    let in_ports = get_ports(target_client, PortDirection::Input)?;
+    let (jc, _) = jack::Client::new("bn-wire", jack::ClientOptions::NO_START_SERVER)
+        .map_err(|e| Error::Wiring(format!("JACK probe for MIDI wiring failed: {e}")))?;
 
-    let midi_outs: Vec<_> = out_ports.iter().filter(|p| is_midi_port(p)).collect();
-    let midi_ins: Vec<_> = in_ports.iter().filter(|p| is_midi_port(p)).collect();
+    let router_prefix = format!("{router_client}:");
+    let target_prefix = format!("{target_client}:");
 
-    // Wire first MIDI out matching this target to first MIDI in
-    let router_port = midi_outs
+    let all_midi_outs = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_OUTPUT);
+    let all_midi_ins = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_INPUT);
+
+    let router_port = all_midi_outs
         .iter()
-        .find(|p| p.contains(target_client))
-        .or(midi_outs.first());
-    let target_port = midi_ins.first();
+        .find(|p| p.starts_with(&router_prefix) && p.contains(target_client));
+    let target_port = all_midi_ins
+        .iter()
+        .find(|p| p.starts_with(&target_prefix));
 
     if let (Some(out), Some(inp)) = (router_port, target_port) {
         pw_link(out, inp)?;

@@ -4,6 +4,11 @@ use std::process::{Child, Command, Stdio};
 use crate::config::PluginConfig;
 use crate::error::Error;
 
+/// Handle to a running `jalv` child process.
+///
+/// Owns the process stdin (for live control changes) and a background thread
+/// that drains stdout. Killing the process and joining the reader thread
+/// happens automatically on [`Drop`].
 pub struct JalvInstance {
     pub name: String,
     child: Child,
@@ -12,6 +17,11 @@ pub struct JalvInstance {
 }
 
 impl JalvInstance {
+    /// Spawn a `jalv.gtk3` process for the given plugin configuration.
+    ///
+    /// The process is started with `--print-controls` so control port info is
+    /// captured on stdout. A background thread drains stdout to prevent the
+    /// child from blocking on a full pipe.
     pub fn spawn(plugin: &PluginConfig, buffer_size: Option<u32>) -> Result<Self, Error> {
         let mut cmd = Command::new("jalv.gtk3");
 
@@ -76,6 +86,8 @@ impl JalvInstance {
         })
     }
 
+    /// Write a control value change to the plugin via jalv's stdin protocol
+    /// (`"symbol = value\n"`).
     pub fn set_control(&mut self, symbol: &str, value: f32) -> Result<(), Error> {
         writeln!(self.stdin, "{symbol} = {value}").map_err(|e| Error::ControlWrite {
             name: self.name.clone(),
@@ -83,15 +95,18 @@ impl JalvInstance {
         })
     }
 
+    /// Returns `true` if the child process has not exited yet.
     pub fn is_running(&mut self) -> bool {
         self.child.try_wait().ok().flatten().is_none()
     }
 
+    /// Send SIGKILL to the child and wait for it to exit.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
+    /// JACK client name registered by this jalv instance.
     pub fn jack_client_name(&self) -> &str {
         &self.name
     }

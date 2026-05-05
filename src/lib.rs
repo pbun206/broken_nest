@@ -1,3 +1,28 @@
+//! **broken_nest** — stateless LV2 plugin chain host built on top of
+//! [jalv](https://gitlab.com/drobilla/jalv).
+//!
+//! Spawns one `jalv` process per plugin, wires their audio ports together via
+//! `pw-link`, and optionally routes MIDI to plugins that expose MIDI inputs.
+//!
+//! # Quick start
+//!
+//! ```no_run
+//! use broken_nest::{Chain, ChainConfig};
+//!
+//! let toml = std::fs::read_to_string("chain.toml").unwrap();
+//! let config: ChainConfig = toml::from_str(&toml).unwrap();
+//! let mut chain = Chain::start(&config).unwrap();
+//!
+//! // Send MIDI to a plugin
+//! if let Ok(sender) = chain.midi_sender("synth") {
+//!     sender.send(broken_nest::MidiEvent::NoteOn {
+//!         channel: 0, note: 60, velocity: 100,
+//!     }).ok();
+//! }
+//!
+//! chain.stop();
+//! ```
+
 pub mod chain;
 pub mod config;
 pub mod error;

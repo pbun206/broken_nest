@@ -1,5 +1,9 @@
 use rtrb::{Consumer, Producer, RingBuffer};
 
+/// A MIDI message that can be sent to a plugin via [`MidiSender`].
+///
+/// Covers the most common channel messages. Use [`MidiEvent::Raw`] for
+/// anything else (SysEx is not supported — max 3 bytes).
 #[derive(Debug, Clone, Copy)]
 pub enum MidiEvent {
     NoteOn { channel: u8, note: u8, velocity: u8 },
@@ -11,6 +15,8 @@ pub enum MidiEvent {
 }
 
 impl MidiEvent {
+    /// Encode as raw MIDI bytes. Returns `(length, bytes)` — only the first
+    /// `length` bytes of the array are valid.
     pub fn to_bytes(&self) -> (usize, [u8; 3]) {
         match *self {
             MidiEvent::NoteOn { channel, note, velocity } => {
@@ -36,21 +42,28 @@ impl MidiEvent {
     }
 }
 
+/// Thread-safe, lock-free sender for pushing MIDI events into a plugin's
+/// ring buffer. Obtained via [`Chain::midi_sender`](crate::Chain::midi_sender).
 pub struct MidiSender {
     producer: Producer<MidiEvent>,
 }
 
 impl MidiSender {
+    /// Enqueue a MIDI event. Returns `Err(event)` if the ring buffer is full.
     pub fn send(&mut self, event: MidiEvent) -> Result<(), MidiEvent> {
         self.producer.push(event).map_err(|rtrb::PushError::Full(v)| v)
     }
 }
 
+/// Consumer side of a single plugin's MIDI channel, paired with the JACK
+/// output port name it will be registered under.
 pub(crate) struct MidiPort {
     pub name: String,
     pub consumer: Consumer<MidiEvent>,
 }
 
+/// Create a lock-free MIDI channel: a [`MidiSender`] for the caller and a
+/// [`MidiPort`] that the [`MidiRouter`] will drain in the JACK process callback.
 pub(crate) fn create_midi_channel(name: &str, capacity: usize) -> (MidiSender, MidiPort) {
     let (producer, consumer) = RingBuffer::new(capacity);
     let sender = MidiSender { producer };
@@ -61,10 +74,14 @@ pub(crate) fn create_midi_channel(name: &str, capacity: usize) -> (MidiSender, M
     (sender, port)
 }
 
+/// JACK client that owns one MIDI output port per plugin and drains the
+/// corresponding ring buffers in the real-time process callback.
 pub(crate) struct MidiRouter {
     _client: jack::AsyncClient<(), MidiProcessHandler>,
 }
 
+/// Real-time JACK process handler. Each cycle, drains every ring buffer and
+/// writes the encoded MIDI bytes to the corresponding JACK MIDI output port.
 pub(crate) struct MidiProcessHandler {
     ports: Vec<(jack::Port<jack::MidiOut>, Consumer<MidiEvent>)>,
 }
@@ -86,6 +103,8 @@ impl jack::ProcessHandler for MidiProcessHandler {
 }
 
 impl MidiRouter {
+    /// Create and activate a JACK client with one MIDI output port per
+    /// [`MidiPort`]. The client immediately starts processing audio cycles.
     pub fn new(
         client_name: &str,
         ports: Vec<MidiPort>,

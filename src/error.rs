@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+/// Errors that can occur while building or running a plugin chain.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to spawn jalv for plugin '{name}': {source}")]
@@ -31,4 +32,7 @@ pub enum Error {
 
     #[error("pw-link command failed: {0}")]
     PwLink(String),
+
+    #[error("expected exactly one MIDI plugin, found {count}")]
+    AmbiguousMidi { count: usize },
 }
