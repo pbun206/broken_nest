@@ -182,50 +182,87 @@ impl Drop for Chain {
     }
 }
 
+const AUTO_CONNECT_RETRIES: u32 = 5;
+const AUTO_CONNECT_RETRY_MS: u64 = 300;
+
 /// Connect chain endpoints to physical system ports (capture/playback).
 /// Uses JACK API to find physical audio ports by flag, not name.
+/// Re-discovers ports on each retry to handle BT devices whose names change.
 fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), Error> {
-    let (jc, _) = jack::Client::new("bn-autoconnect", jack::ClientOptions::NO_START_SERVER)
-        .map_err(|e| Error::Wiring(format!("JACK client for auto-connect failed: {e}")))?;
-
     if config.auto_connect_input {
         if let Some(first) = instances.first() {
-            let capture_ports = jc.ports(
-                None,
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
-            );
-            let name = first.jack_client_name();
-            let chain_ins = jc.ports(
-                Some(&format!("^{name}:")),
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_INPUT,
-            );
-            for (src, dst) in capture_ports.iter().zip(chain_ins.iter()) {
-                pw_link(src, dst)?;
-            }
+            auto_connect_with_retry(first.jack_client_name(), PortDirection::Input)?;
         }
     }
 
     if config.auto_connect_output {
         if let Some(last) = instances.last() {
-            let playback_ports = jc.ports(
-                None,
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
-            );
-            let name = last.jack_client_name();
-            let chain_outs = jc.ports(
-                Some(&format!("^{name}:")),
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_OUTPUT,
-            );
-            for (src, dst) in chain_outs.iter().zip(playback_ports.iter()) {
-                pw_link(src, dst)?;
-            }
+            auto_connect_with_retry(last.jack_client_name(), PortDirection::Output)?;
         }
     }
 
+    Ok(())
+}
+
+fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Result<(), Error> {
+    let mut last_err = None;
+
+    for attempt in 0..AUTO_CONNECT_RETRIES {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(AUTO_CONNECT_RETRY_MS));
+        }
+
+        let (jc, _) = jack::Client::new("bn-autoconnect", jack::ClientOptions::NO_START_SERVER)
+            .map_err(|e| Error::Wiring(format!("JACK client for auto-connect failed: {e}")))?;
+
+        match direction {
+            PortDirection::Input => {
+                let capture_ports = jc.ports(
+                    None,
+                    Some("32 bit float mono audio"),
+                    jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
+                );
+                let chain_ins = jc.ports(
+                    Some(&format!("^{chain_client}:")),
+                    Some("32 bit float mono audio"),
+                    jack::PortFlags::IS_INPUT,
+                );
+                match try_link_pairs(&capture_ports, &chain_ins) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            PortDirection::Output => {
+                let playback_ports = jc.ports(
+                    None,
+                    Some("32 bit float mono audio"),
+                    jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
+                );
+                let chain_outs = jc.ports(
+                    Some(&format!("^{chain_client}:")),
+                    Some("32 bit float mono audio"),
+                    jack::PortFlags::IS_OUTPUT,
+                );
+                match try_link_pairs(&chain_outs, &playback_ports) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+
+        log::warn!(
+            "auto-connect attempt {}/{AUTO_CONNECT_RETRIES} failed for {chain_client}, retrying",
+            attempt + 1,
+        );
+    }
+
+    Err(last_err.unwrap())
+}
+
+fn try_link_pairs(sources: &[String], destinations: &[String]) -> Result<(), Error> {
+    for (src, dst) in sources.iter().zip(destinations.iter()) {
+        pw_link(src, dst)?;
+    }
     Ok(())
 }
 
