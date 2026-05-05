@@ -1,0 +1,11 @@
+jack_client_prefix = "bn"
+
+[[plugins]]
+uri = "http://calf.sourceforge.net/plugins/Equalizer5Band"
+name = "bn-eq"
+show_ui = true
+
+[[plugins]]
+uri = "http://calf.sourceforge.net/plugins/Compressor"
+name = "bn-comp"
+show_ui = true

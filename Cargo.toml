@@ -1,0 +1,21 @@
+[package]
+name = "broken_nest"
+version = "0.1.0"
+edition = "2024"
+description = "LV2 plugin chain host via jalv — stateless orchestrator library"
+
+[lib]
+name = "broken_nest"
+path = "src/lib.rs"
+
+[[bin]]
+name = "broken-nest"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+log = "0.4"
+ctrlc = "3"
+env_logger = "0.11"
