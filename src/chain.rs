@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -5,9 +6,14 @@ use std::time::Duration;
 use crate::config::ChainConfig;
 use crate::error::Error;
 use crate::jalv::JalvInstance;
+use crate::midi::{self, MidiRouter, MidiSender};
+
+const MIDI_RING_CAPACITY: usize = 1024;
 
 pub struct Chain {
     instances: Vec<JalvInstance>,
+    midi_router: Option<MidiRouter>,
+    midi_senders: HashMap<String, MidiSender>,
 }
 
 impl Chain {
@@ -26,14 +32,49 @@ impl Chain {
         // Give jalv time to register JACK ports
         thread::sleep(Duration::from_millis(500));
 
-        // Wire adjacent plugins
+        // Wire adjacent plugins (audio)
         for i in 0..instances.len() - 1 {
             let from = instances[i].jack_client_name().to_string();
             let to = instances[i + 1].jack_client_name().to_string();
             wire_plugins(&from, &to)?;
         }
 
-        Ok(Self { instances })
+        // Create MIDI router — one output port per plugin that has MIDI input
+        let mut midi_senders = HashMap::new();
+        let mut midi_ports = Vec::new();
+
+        for instance in &instances {
+            let name = instance.jack_client_name();
+            if has_midi_input(name) {
+                let (sender, port) = midi::create_midi_channel(name, MIDI_RING_CAPACITY);
+                midi_senders.insert(name.to_string(), sender);
+                midi_ports.push(port);
+            }
+        }
+
+        let midi_router = if !midi_ports.is_empty() {
+            let router_name = format!("{}-midi", config.jack_client_prefix);
+            let router = MidiRouter::new(&router_name, midi_ports)?;
+
+            // Wire MIDI router outputs to plugin MIDI inputs
+            thread::sleep(Duration::from_millis(200));
+            for instance in &instances {
+                let name = instance.jack_client_name();
+                if midi_senders.contains_key(name) {
+                    wire_midi(&format!("{}-midi", config.jack_client_prefix), name)?;
+                }
+            }
+
+            Some(router)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            instances,
+            midi_router,
+            midi_senders,
+        })
     }
 
     pub fn set_control(
@@ -52,7 +93,17 @@ impl Chain {
         instance.set_control(port, value)
     }
 
+    pub fn midi_sender(&mut self, plugin_name: &str) -> Result<&mut MidiSender, Error> {
+        self.midi_senders
+            .get_mut(plugin_name)
+            .ok_or_else(|| Error::PluginNotFound {
+                name: plugin_name.into(),
+            })
+    }
+
     pub fn stop(&mut self) {
+        self.midi_senders.clear();
+        drop(self.midi_router.take());
         for instance in &mut self.instances {
             instance.kill();
         }
@@ -159,9 +210,38 @@ fn pw_link(from: &str, to: &str) -> Result<(), Error> {
 }
 
 fn is_audio_port(port: &str) -> bool {
-    // Filter out MIDI/control ports — audio ports typically contain
-    // "audio", "out_l", "out_r", "in_l", "in_r", "output", "input"
-    // MIDI ports contain "midi", "event"
     let lower = port.to_lowercase();
     !lower.contains("midi") && !lower.contains("event") && !lower.contains("control")
+}
+
+fn is_midi_port(port: &str) -> bool {
+    let lower = port.to_lowercase();
+    lower.contains("midi") || lower.contains("event")
+}
+
+fn has_midi_input(client: &str) -> bool {
+    get_ports(client, PortDirection::Input)
+        .map(|ports| ports.iter().any(|p| is_midi_port(p)))
+        .unwrap_or(false)
+}
+
+fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
+    let out_ports = get_ports(router_client, PortDirection::Output)?;
+    let in_ports = get_ports(target_client, PortDirection::Input)?;
+
+    let midi_outs: Vec<_> = out_ports.iter().filter(|p| is_midi_port(p)).collect();
+    let midi_ins: Vec<_> = in_ports.iter().filter(|p| is_midi_port(p)).collect();
+
+    // Wire first MIDI out matching this target to first MIDI in
+    let router_port = midi_outs
+        .iter()
+        .find(|p| p.contains(target_client))
+        .or(midi_outs.first());
+    let target_port = midi_ins.first();
+
+    if let (Some(out), Some(inp)) = (router_port, target_port) {
+        pw_link(out, inp)?;
+    }
+
+    Ok(())
 }
