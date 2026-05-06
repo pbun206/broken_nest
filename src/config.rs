@@ -22,6 +22,9 @@ pub struct ChainConfig {
     /// Connect last plugin's audio output to system playback (speakers).
     #[serde(default)]
     pub auto_connect_output: bool,
+    /// Directory for persisting plugin control state across restarts.
+    /// Each plugin's controls are saved to `<state_dir>/<plugin_name>.toml`.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Configuration for a single LV2 plugin instance.

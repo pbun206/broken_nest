@@ -35,4 +35,10 @@ pub enum Error {
 
     #[error("expected exactly one MIDI plugin, found {count}")]
     AmbiguousMidi { count: usize },
+
+    #[error("state I/O error for plugin '{name}': {source}")]
+    StateIo {
+        name: String,
+        source: std::io::Error,
+    },
 }

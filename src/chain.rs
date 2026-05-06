@@ -1,14 +1,15 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
 use crate::config::ChainConfig;
 use crate::error::Error;
-use crate::jalv::JalvInstance;
+use crate::jalv::{JalvInstance, UiMode};
 use crate::midi::{self, MidiRouter, MidiSender};
 
-/// Per-plugin ring buffer capacity for queued MIDI events.
 const MIDI_RING_CAPACITY: usize = 1024;
 
 /// A running chain of LV2 plugins wired in series.
@@ -21,6 +22,7 @@ const MIDI_RING_CAPACITY: usize = 1024;
 /// Drop or call [`Chain::stop`] to tear down all child processes and JACK
 /// connections.
 pub struct Chain {
+    config: ChainConfig,
     instances: Vec<JalvInstance>,
     midi_router: Option<MidiRouter>,
     midi_senders: HashMap<String, MidiSender>,
@@ -29,8 +31,11 @@ pub struct Chain {
 impl Chain {
     /// Spawn all plugins, wire audio ports in series, and set up MIDI routing.
     ///
-    /// Blocks briefly (~700 ms) while jalv processes register their JACK ports.
-    /// Returns an error if any plugin fails to spawn or wiring fails.
+    /// Plugins start headless (no GUI window) by default. Call [`show_ui`] or
+    /// [`show_all_ui`] to open plugin windows.
+    ///
+    /// If `ChainConfig::state_dir` is set, saved control values are restored
+    /// automatically.
     pub fn start(config: &ChainConfig) -> Result<Self, Error> {
         if config.plugins.is_empty() {
             return Err(Error::Config("chain has no plugins".into()));
@@ -39,11 +44,12 @@ impl Chain {
         let mut instances = Vec::with_capacity(config.plugins.len());
 
         for plugin in &config.plugins {
-            let instance = JalvInstance::spawn(plugin, config.buffer_size)?;
+            let saved = load_controls(&config.state_dir, &plugin.name);
+            let mode = if plugin.show_ui { UiMode::Gtk } else { UiMode::Headless };
+            let instance = JalvInstance::spawn(plugin, config.buffer_size, mode, &saved)?;
             instances.push(instance);
         }
 
-        // Give jalv time to register JACK ports
         thread::sleep(Duration::from_millis(500));
 
         // Wire adjacent plugins (audio)
@@ -53,12 +59,11 @@ impl Chain {
             wire_plugins(&from, &to)?;
         }
 
-        // Auto-connect to system physical ports
         if config.auto_connect_input || config.auto_connect_output {
             auto_connect(&instances, config)?;
         }
 
-        // Create MIDI router — one output port per plugin that has MIDI input
+        // MIDI routing
         let mut midi_senders = HashMap::new();
         let mut midi_ports = Vec::new();
 
@@ -78,7 +83,6 @@ impl Chain {
             let router_name = format!("{}-midi", config.jack_client_prefix);
             let router = MidiRouter::new(&router_name, midi_ports)?;
 
-            // Wire MIDI router outputs to plugin MIDI inputs
             thread::sleep(Duration::from_millis(200));
             for instance in &instances {
                 let name = instance.jack_client_name();
@@ -93,6 +97,7 @@ impl Chain {
         };
 
         Ok(Self {
+            config: config.clone(),
             instances,
             midi_router,
             midi_senders,
@@ -100,9 +105,6 @@ impl Chain {
     }
 
     /// Set a control port value on a running plugin.
-    ///
-    /// `plugin_name` must match [`PluginConfig::name`](crate::PluginConfig::name).
-    /// `port` is the LV2 port symbol (e.g. `"threshold"`).
     pub fn set_control(
         &mut self,
         plugin_name: &str,
@@ -120,9 +122,6 @@ impl Chain {
     }
 
     /// Get a [`MidiSender`] for pushing MIDI events to the named plugin.
-    ///
-    /// Returns [`Error::PluginNotFound`] if the plugin has no MIDI input or
-    /// doesn't exist.
     pub fn midi_sender(&mut self, plugin_name: &str) -> Result<&mut MidiSender, Error> {
         self.midi_senders
             .get_mut(plugin_name)
@@ -132,9 +131,6 @@ impl Chain {
     }
 
     /// Get the [`MidiSender`] when exactly one plugin in the chain accepts MIDI.
-    ///
-    /// Returns [`Error::AmbiguousMidi`] if zero or more than one plugin has
-    /// MIDI input.
     pub fn sole_midi_sender(&mut self) -> Result<&mut MidiSender, Error> {
         if self.midi_senders.len() != 1 {
             return Err(Error::AmbiguousMidi {
@@ -144,8 +140,63 @@ impl Chain {
         Ok(self.midi_senders.values_mut().next().unwrap())
     }
 
-    /// Tear down the chain: drop MIDI resources, kill all jalv processes.
+    /// Show the plugin UI window. Respawns as `jalv.gtk3` if currently headless.
+    /// Brief audio gap (~1s) during respawn.
+    pub fn show_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
+        let idx = self.find_plugin_idx(plugin_name)?;
+
+        if self.instances[idx].ui_mode() == UiMode::Gtk && self.instances[idx].is_running() {
+            return Ok(());
+        }
+
+        self.respawn_plugin(idx, UiMode::Gtk)
+    }
+
+    /// Hide the plugin UI window. Respawns as headless `jalv`.
+    /// Brief audio gap (~1s) during respawn.
+    pub fn hide_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
+        let idx = self.find_plugin_idx(plugin_name)?;
+
+        if self.instances[idx].ui_mode() == UiMode::Headless && self.instances[idx].is_running() {
+            return Ok(());
+        }
+
+        self.respawn_plugin(idx, UiMode::Headless)
+    }
+
+    /// Show UI windows for all plugins.
+    pub fn show_all_ui(&mut self) -> Result<(), Error> {
+        let names: Vec<String> = self.instances.iter().map(|i| i.name.clone()).collect();
+        for name in names {
+            self.show_ui(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Hide UI windows for all plugins.
+    pub fn hide_all_ui(&mut self) -> Result<(), Error> {
+        let names: Vec<String> = self.instances.iter().map(|i| i.name.clone()).collect();
+        for name in names {
+            self.hide_ui(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Check all plugins and auto-respawn any that died (headless).
+    pub fn check_health(&mut self) {
+        for idx in 0..self.instances.len() {
+            if !self.instances[idx].is_running() {
+                log::warn!("plugin '{}' died, respawning headless", self.instances[idx].name);
+                if let Err(e) = self.respawn_plugin(idx, UiMode::Headless) {
+                    log::error!("failed to respawn '{}': {e}", self.config.plugins[idx].name);
+                }
+            }
+        }
+    }
+
+    /// Tear down the chain: save state, drop MIDI resources, kill all jalv processes.
     pub fn stop(&mut self) {
+        self.save_all_state();
         self.midi_senders.clear();
         drop(self.midi_router.take());
         for instance in &mut self.instances {
@@ -159,7 +210,7 @@ impl Chain {
         self.instances.iter_mut().all(|i| i.is_running())
     }
 
-    /// JACK port names for the first plugin's stereo audio input (`in_l`, `in_r`).
+    /// JACK port names for the first plugin's stereo audio input.
     pub fn chain_input_ports(&self) -> Option<(String, String)> {
         self.instances.first().map(|i| {
             let name = i.jack_client_name();
@@ -167,12 +218,97 @@ impl Chain {
         })
     }
 
-    /// JACK port names for the last plugin's stereo audio output (`out_l`, `out_r`).
+    /// JACK port names for the last plugin's stereo audio output.
     pub fn chain_output_ports(&self) -> Option<(String, String)> {
         self.instances.last().map(|i| {
             let name = i.jack_client_name();
             (format!("{name}:out_l"), format!("{name}:out_r"))
         })
+    }
+
+    /// Snapshot of control values for all plugins.
+    pub fn all_controls(&self) -> HashMap<String, HashMap<String, f32>> {
+        self.instances
+            .iter()
+            .map(|i| (i.name.clone(), i.current_controls()))
+            .collect()
+    }
+
+    fn find_plugin_idx(&self, name: &str) -> Result<usize, Error> {
+        self.instances
+            .iter()
+            .position(|i| i.jack_client_name() == name)
+            .ok_or_else(|| Error::PluginNotFound { name: name.into() })
+    }
+
+    fn respawn_plugin(&mut self, idx: usize, mode: UiMode) -> Result<(), Error> {
+        let controls = self.instances[idx].current_controls();
+        self.instances[idx].kill();
+
+        let plugin = &self.config.plugins[idx];
+        let instance = JalvInstance::spawn(plugin, self.config.buffer_size, mode, &controls)?;
+        self.instances[idx] = instance;
+
+        thread::sleep(Duration::from_millis(500));
+
+        // Rewire audio: previous plugin → this → next plugin
+        if idx > 0 {
+            let from = self.instances[idx - 1].jack_client_name().to_string();
+            let to = self.instances[idx].jack_client_name().to_string();
+            wire_plugins(&from, &to)?;
+        }
+        if idx + 1 < self.instances.len() {
+            let from = self.instances[idx].jack_client_name().to_string();
+            let to = self.instances[idx + 1].jack_client_name().to_string();
+            wire_plugins(&from, &to)?;
+        }
+
+        // Rewire auto-connect if this is first/last
+        if idx == 0 && self.config.auto_connect_input {
+            auto_connect_with_retry(
+                self.instances[0].jack_client_name(),
+                PortDirection::Input,
+            )?;
+        }
+        if idx == self.instances.len() - 1 && self.config.auto_connect_output {
+            auto_connect_with_retry(
+                self.instances.last().unwrap().jack_client_name(),
+                PortDirection::Output,
+            )?;
+        }
+
+        // Rewire MIDI if applicable
+        let name = self.instances[idx].jack_client_name().to_string();
+        if self.midi_senders.contains_key(&name) {
+            wire_midi(&format!("{}-midi", self.config.jack_client_prefix), &name)?;
+        }
+
+        Ok(())
+    }
+
+    fn save_all_state(&self) {
+        let state_dir = match &self.config.state_dir {
+            Some(d) => d,
+            None => return,
+        };
+
+        if let Err(e) = fs::create_dir_all(state_dir) {
+            log::error!("failed to create state dir {}: {e}", state_dir.display());
+            return;
+        }
+
+        for instance in &self.instances {
+            let controls = instance.current_controls();
+            if controls.is_empty() {
+                continue;
+            }
+            let path = state_dir.join(format!("{}.toml", instance.name));
+            if let Err(e) = save_controls_file(&path, &controls) {
+                log::error!("failed to save state for '{}': {e}", instance.name);
+            } else {
+                log::debug!("saved state for '{}' ({} controls)", instance.name, controls.len());
+            }
+        }
     }
 }
 
@@ -182,12 +318,57 @@ impl Drop for Chain {
     }
 }
 
+// --- State I/O ---
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ControlState {
+    controls: HashMap<String, f32>,
+}
+
+fn save_controls_file(path: &Path, controls: &HashMap<String, f32>) -> Result<(), std::io::Error> {
+    let state = ControlState {
+        controls: controls.clone(),
+    };
+    let toml_str = toml::to_string_pretty(&state)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    fs::write(path, toml_str)
+}
+
+fn load_controls(state_dir: &Option<PathBuf>, plugin_name: &str) -> HashMap<String, f32> {
+    let dir = match state_dir {
+        Some(d) => d,
+        None => return HashMap::new(),
+    };
+    let path = dir.join(format!("{plugin_name}.toml"));
+    if !path.exists() {
+        return HashMap::new();
+    }
+    match fs::read_to_string(&path) {
+        Ok(contents) => match toml::from_str::<ControlState>(&contents) {
+            Ok(state) => {
+                log::debug!(
+                    "restored {} controls for '{plugin_name}'",
+                    state.controls.len()
+                );
+                state.controls
+            }
+            Err(e) => {
+                log::warn!("invalid state file {}: {e}", path.display());
+                HashMap::new()
+            }
+        },
+        Err(e) => {
+            log::warn!("failed to read state file {}: {e}", path.display());
+            HashMap::new()
+        }
+    }
+}
+
+// --- Auto-connect ---
+
 const AUTO_CONNECT_RETRIES: u32 = 5;
 const AUTO_CONNECT_RETRY_MS: u64 = 300;
 
-/// Connect chain endpoints to physical system ports (capture/playback).
-/// Uses JACK API to find physical audio ports by flag, not name.
-/// Re-discovers ports on each retry to handle BT devices whose names change.
 fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), Error> {
     if config.auto_connect_input {
         if let Some(first) = instances.first() {
@@ -259,10 +440,6 @@ fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Resu
     Err(last_err.unwrap())
 }
 
-/// Pairwise link ports with the JACK API.
-///
-/// Auto-connect discovers ports with JACK, so connecting through JACK keeps the
-/// naming namespace consistent (avoids JACK-name vs `pw-link`-name mismatches).
 fn try_link_pairs_jack(
     jc: &jack::Client,
     sources: &[String],
@@ -279,7 +456,6 @@ fn try_link_pairs_jack(
     for (src, dst) in sources.iter().zip(destinations.iter()) {
         match jc.connect_ports_by_name(src, dst) {
             Ok(()) => {}
-            // Already-linked ports should not fail chain startup.
             Err(jack::Error::PortAlreadyConnected(_, _)) => {}
             Err(e) => {
                 return Err(Error::Wiring(format!(
@@ -292,21 +468,15 @@ fn try_link_pairs_jack(
     Ok(())
 }
 
-/// Wire audio output ports of `from` to audio input ports of `to` via `pw-link`.
+// --- Port wiring ---
+
 fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
     let out_ports = get_ports(from, PortDirection::Output)?;
     let in_ports = get_ports(to, PortDirection::Input)?;
 
-    let audio_outs: Vec<_> = out_ports
-        .iter()
-        .filter(|p| is_audio_port(p))
-        .collect();
-    let audio_ins: Vec<_> = in_ports
-        .iter()
-        .filter(|p| is_audio_port(p))
-        .collect();
+    let audio_outs: Vec<_> = out_ports.iter().filter(|p| is_audio_port(p)).collect();
+    let audio_ins: Vec<_> = in_ports.iter().filter(|p| is_audio_port(p)).collect();
 
-    // Wire matching channels: out[0]→in[0], out[1]→in[1], etc.
     for (out, inp) in audio_outs.iter().zip(audio_ins.iter()) {
         pw_link(out, inp)?;
     }
@@ -320,8 +490,6 @@ enum PortDirection {
     Input,
 }
 
-/// List JACK ports for `client` using `pw-link`. Retries up to 10 times
-/// (200 ms apart) while the client is still registering ports.
 fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Error> {
     let flag = match direction {
         PortDirection::Output => "-o",
@@ -351,7 +519,6 @@ fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Erro
     }
 }
 
-/// Create a single PipeWire link between two JACK ports.
 fn pw_link(from: &str, to: &str) -> Result<(), Error> {
     let output = Command::new("pw-link")
         .arg(from)
@@ -380,9 +547,6 @@ fn is_midi_port(port: &str) -> bool {
     lower.contains("midi") || lower.contains("event")
 }
 
-/// Check if `client` has any MIDI input ports via JACK API (queries port type,
-/// not name — works for plugins like DrumGizmo that name their MIDI port
-/// `control`).
 fn has_midi_input(client: &str) -> bool {
     let probe = jack::Client::new("bn-probe", jack::ClientOptions::NO_START_SERVER);
     let (jc, _) = match probe {
@@ -393,11 +557,7 @@ fn has_midi_input(client: &str) -> bool {
         }
     };
     let prefix = format!("{client}:");
-    let midi_ins = jc.ports(
-        None,
-        Some("8 bit raw midi"),
-        jack::PortFlags::IS_INPUT,
-    );
+    let midi_ins = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_INPUT);
     midi_ins.iter().any(|p| p.starts_with(&prefix))
 }
 
@@ -407,9 +567,6 @@ fn has_midi_input_heuristic(client: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Wire the MIDI router's output port for `target_client` to the target's
-/// first MIDI input port. Uses JACK API to identify MIDI ports by type rather
-/// than name.
 fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
     let (jc, _) = jack::Client::new("bn-wire", jack::ClientOptions::NO_START_SERVER)
         .map_err(|e| Error::Wiring(format!("JACK probe for MIDI wiring failed: {e}")))?;
