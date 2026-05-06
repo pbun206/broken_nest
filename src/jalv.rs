@@ -55,17 +55,17 @@ impl JalvInstance {
 
         // Saved state first, then config controls override
         for (sym, val) in initial_controls {
-            cmd.arg("-c").arg(format!("{sym}={val}"));
+            cmd.arg(format!("--control={sym}={val}"));
         }
         for (sym, val) in &plugin.controls {
-            cmd.arg("-c").arg(format!("{sym}={val}"));
+            cmd.arg(format!("--control={sym}={val}"));
         }
 
         if let Some(ref state_dir) = plugin.state_dir {
             if !state_dir.exists() {
                 return Err(Error::StateDirMissing(state_dir.clone()));
             }
-            cmd.arg("-l").arg(state_dir);
+            cmd.arg(format!("--load={}", state_dir.display()));
         }
 
         cmd.arg(&plugin.uri);
