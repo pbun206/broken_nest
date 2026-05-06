@@ -227,7 +227,7 @@ fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Resu
                     Some("32 bit float mono audio"),
                     jack::PortFlags::IS_INPUT,
                 );
-                match try_link_pairs(&capture_ports, &chain_ins) {
+                match try_link_pairs_jack(&jc, &capture_ports, &chain_ins) {
                     Ok(()) => return Ok(()),
                     Err(e) => last_err = Some(e),
                 }
@@ -243,7 +243,7 @@ fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Resu
                     Some("32 bit float mono audio"),
                     jack::PortFlags::IS_OUTPUT,
                 );
-                match try_link_pairs(&chain_outs, &playback_ports) {
+                match try_link_pairs_jack(&jc, &chain_outs, &playback_ports) {
                     Ok(()) => return Ok(()),
                     Err(e) => last_err = Some(e),
                 }
@@ -259,10 +259,36 @@ fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Resu
     Err(last_err.unwrap())
 }
 
-fn try_link_pairs(sources: &[String], destinations: &[String]) -> Result<(), Error> {
-    for (src, dst) in sources.iter().zip(destinations.iter()) {
-        pw_link(src, dst)?;
+/// Pairwise link ports with the JACK API.
+///
+/// Auto-connect discovers ports with JACK, so connecting through JACK keeps the
+/// naming namespace consistent (avoids JACK-name vs `pw-link`-name mismatches).
+fn try_link_pairs_jack(
+    jc: &jack::Client,
+    sources: &[String],
+    destinations: &[String],
+) -> Result<(), Error> {
+    if sources.is_empty() || destinations.is_empty() {
+        return Err(Error::Wiring(format!(
+            "auto-connect found no linkable ports (sources: {}, destinations: {})",
+            sources.len(),
+            destinations.len(),
+        )));
     }
+
+    for (src, dst) in sources.iter().zip(destinations.iter()) {
+        match jc.connect_ports_by_name(src, dst) {
+            Ok(()) => {}
+            // Already-linked ports should not fail chain startup.
+            Err(jack::Error::PortAlreadyConnected(_, _)) => {}
+            Err(e) => {
+                return Err(Error::Wiring(format!(
+                    "jack connect {src} → {dst} failed: {e}"
+                )));
+            }
+        }
+    }
+
     Ok(())
 }
 
