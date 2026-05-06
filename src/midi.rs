@@ -1,4 +1,5 @@
 use rtrb::{Consumer, Producer, RingBuffer};
+use std::sync::{Arc, Mutex};
 
 /// A MIDI message that can be sent to a plugin via [`MidiSender`].
 ///
@@ -42,16 +43,20 @@ impl MidiEvent {
     }
 }
 
-/// Thread-safe, lock-free sender for pushing MIDI events into a plugin's
-/// ring buffer. Obtained via [`Chain::midi_sender`](crate::Chain::midi_sender).
+/// Cloneable sender handle for pushing MIDI events into a plugin's ring buffer.
+/// Obtained via [`Chain::midi_sender`](crate::Chain::midi_sender).
+#[derive(Clone)]
 pub struct MidiSender {
-    producer: Producer<MidiEvent>,
+    producer: Arc<Mutex<Producer<MidiEvent>>>,
 }
 
 impl MidiSender {
     /// Enqueue a MIDI event. Returns `Err(event)` if the ring buffer is full.
-    pub fn send(&mut self, event: MidiEvent) -> Result<(), MidiEvent> {
-        self.producer.push(event).map_err(|rtrb::PushError::Full(v)| v)
+    pub fn send(&self, event: MidiEvent) -> Result<(), MidiEvent> {
+        // `rtrb` is SPSC, so multiple sender handles serialize access to the
+        // single producer via a mutex while still sharing the same queue.
+        let mut producer = self.producer.lock().map_err(|_| event)?;
+        producer.push(event).map_err(|rtrb::PushError::Full(v)| v)
     }
 }
 
@@ -66,7 +71,9 @@ pub(crate) struct MidiPort {
 /// [`MidiPort`] that the [`MidiRouter`] will drain in the JACK process callback.
 pub(crate) fn create_midi_channel(name: &str, capacity: usize) -> (MidiSender, MidiPort) {
     let (producer, consumer) = RingBuffer::new(capacity);
-    let sender = MidiSender { producer };
+    let sender = MidiSender {
+        producer: Arc::new(Mutex::new(producer)),
+    };
     let port = MidiPort {
         name: name.to_string(),
         consumer,
