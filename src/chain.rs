@@ -270,13 +270,13 @@ impl Chain {
 
         // Rewire auto-connect if this is first/last
         if idx == 0 && self.config.auto_connect_input {
-            auto_connect_with_retry(
+            auto_connect_chain(
                 self.instances[0].jack_client_name(),
                 PortDirection::Input,
             )?;
         }
         if idx == self.instances.len() - 1 && self.config.auto_connect_output {
-            auto_connect_with_retry(
+            auto_connect_chain(
                 self.instances.last().unwrap().jack_client_name(),
                 PortDirection::Output,
             )?;
@@ -374,78 +374,50 @@ fn load_controls(state_dir: &Path, plugin_name: &str) -> HashMap<String, f32> {
 
 // --- Auto-connect ---
 
-const AUTO_CONNECT_RETRIES: u32 = 5;
-const AUTO_CONNECT_RETRY_MS: u64 = 300;
-
 fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), Error> {
     if config.auto_connect_input {
         if let Some(first) = instances.first() {
-            auto_connect_with_retry(first.jack_client_name(), PortDirection::Input)?;
+            auto_connect_chain(first.jack_client_name(), PortDirection::Input)?;
         }
     }
 
     if config.auto_connect_output {
         if let Some(last) = instances.last() {
-            auto_connect_with_retry(last.jack_client_name(), PortDirection::Output)?;
+            auto_connect_chain(last.jack_client_name(), PortDirection::Output)?;
         }
     }
 
     Ok(())
 }
 
-fn auto_connect_with_retry(chain_client: &str, direction: PortDirection) -> Result<(), Error> {
-    let mut last_err = None;
+fn auto_connect_chain(chain_client: &str, direction: PortDirection) -> Result<(), Error> {
+    let (jc, _) = jack::Client::new("bn-autoconnect", jack::ClientOptions::NO_START_SERVER)
+        .map_err(|e| Error::Wiring(format!("JACK client for auto-connect failed: {e}")))?;
 
-    for attempt in 0..AUTO_CONNECT_RETRIES {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(AUTO_CONNECT_RETRY_MS));
+    match direction {
+        PortDirection::Input => {
+            let capture_ports = jc.ports(
+                None,
+                Some("32 bit float mono audio"),
+                jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
+            );
+            let chain_ins = wait_for_client_ports(
+                &jc, chain_client, "32 bit float mono audio", jack::PortFlags::IS_INPUT,
+            )?;
+            try_link_pairs_jack(&jc, &capture_ports, &chain_ins)
         }
-
-        let (jc, _) = jack::Client::new("bn-autoconnect", jack::ClientOptions::NO_START_SERVER)
-            .map_err(|e| Error::Wiring(format!("JACK client for auto-connect failed: {e}")))?;
-
-        match direction {
-            PortDirection::Input => {
-                let capture_ports = jc.ports(
-                    None,
-                    Some("32 bit float mono audio"),
-                    jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
-                );
-                let chain_ins = jc.ports(
-                    Some(&format!("^{chain_client}:")),
-                    Some("32 bit float mono audio"),
-                    jack::PortFlags::IS_INPUT,
-                );
-                match try_link_pairs_jack(&jc, &capture_ports, &chain_ins) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => last_err = Some(e),
-                }
-            }
-            PortDirection::Output => {
-                let playback_ports = jc.ports(
-                    None,
-                    Some("32 bit float mono audio"),
-                    jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
-                );
-                let chain_outs = jc.ports(
-                    Some(&format!("^{chain_client}:")),
-                    Some("32 bit float mono audio"),
-                    jack::PortFlags::IS_OUTPUT,
-                );
-                match try_link_pairs_jack(&jc, &chain_outs, &playback_ports) {
-                    Ok(()) => return Ok(()),
-                    Err(e) => last_err = Some(e),
-                }
-            }
+        PortDirection::Output => {
+            let playback_ports = jc.ports(
+                None,
+                Some("32 bit float mono audio"),
+                jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
+            );
+            let chain_outs = wait_for_client_ports(
+                &jc, chain_client, "32 bit float mono audio", jack::PortFlags::IS_OUTPUT,
+            )?;
+            try_link_pairs_jack(&jc, &chain_outs, &playback_ports)
         }
-
-        log::warn!(
-            "auto-connect attempt {}/{AUTO_CONNECT_RETRIES} failed for {chain_client}, retrying",
-            attempt + 1,
-        );
     }
-
-    Err(last_err.unwrap())
 }
 
 fn try_link_pairs_jack(
