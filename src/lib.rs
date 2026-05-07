@@ -7,10 +7,25 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use broken_nest::{Chain, ChainConfig};
+//! use broken_nest::{Chain, ChainConfig, PluginConfig};
 //!
-//! let toml = std::fs::read_to_string("chain.toml").unwrap();
-//! let config: ChainConfig = toml::from_str(&toml).unwrap();
+//! let config = ChainConfig {
+//!     plugins: vec![
+//!         PluginConfig {
+//!             uri: "http://calf.sourceforge.net/plugins/Compressor".into(),
+//!             name: "comp".into(),
+//!             ..Default::default()
+//!         },
+//!         PluginConfig {
+//!             uri: "http://calf.sourceforge.net/plugins/Equalizer5Band".into(),
+//!             name: "eq".into(),
+//!             ..Default::default()
+//!         },
+//!     ],
+//!     auto_connect_output: true,
+//!     ..Default::default()
+//! };
+//!
 //! let mut chain = Chain::start(&config).unwrap();
 //!
 //! // Send MIDI to a plugin

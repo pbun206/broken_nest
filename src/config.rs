@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// Top-level configuration for a plugin chain, deserialized from TOML.
+/// Top-level configuration for a plugin chain.
 ///
 /// Defines the ordered list of plugins and global settings that apply to every
 /// plugin in the chain (e.g. JACK buffer size).
@@ -58,4 +58,30 @@ fn default_prefix() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+impl Default for ChainConfig {
+    fn default() -> Self {
+        Self {
+            plugins: Vec::new(),
+            jack_client_prefix: default_prefix(),
+            buffer_size: None,
+            auto_connect_input: false,
+            auto_connect_output: false,
+            state_dir: None,
+        }
+    }
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            uri: String::new(),
+            name: String::new(),
+            controls: HashMap::new(),
+            state_dir: None,
+            show_ui: true,
+            midi_in: None,
+        }
+    }
 }
