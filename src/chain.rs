@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,10 +42,11 @@ impl Chain {
             return Err(Error::Config("chain has no plugins".into()));
         }
 
+        let state_dir = state_dir_for(&config.name);
         let mut instances = Vec::with_capacity(config.plugins.len());
 
         for plugin in &config.plugins {
-            let saved = load_controls(&config.state_dir, &plugin.name);
+            let saved = load_controls(&state_dir, &plugin.name);
             let mode = if plugin.show_ui { UiMode::Gtk } else { UiMode::Headless };
             let instance = JalvInstance::spawn(plugin, config.buffer_size, mode, &saved)?;
             instances.push(instance);
@@ -287,12 +289,9 @@ impl Chain {
     }
 
     fn save_all_state(&self) {
-        let state_dir = match &self.config.state_dir {
-            Some(d) => d,
-            None => return,
-        };
+        let state_dir = state_dir_for(&self.config.name);
 
-        if let Err(e) = fs::create_dir_all(state_dir) {
+        if let Err(e) = fs::create_dir_all(&state_dir) {
             log::error!("failed to create state dir {}: {e}", state_dir.display());
             return;
         }
@@ -325,6 +324,16 @@ struct ControlState {
     controls: HashMap<String, f32>,
 }
 
+fn state_dir_for(chain_name: &str) -> PathBuf {
+    let base = env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".local/share")
+        });
+    base.join("broken_nest").join(chain_name)
+}
+
 fn save_controls_file(path: &Path, controls: &HashMap<String, f32>) -> Result<(), std::io::Error> {
     let state = ControlState {
         controls: controls.clone(),
@@ -334,12 +343,8 @@ fn save_controls_file(path: &Path, controls: &HashMap<String, f32>) -> Result<()
     fs::write(path, toml_str)
 }
 
-fn load_controls(state_dir: &Option<PathBuf>, plugin_name: &str) -> HashMap<String, f32> {
-    let dir = match state_dir {
-        Some(d) => d,
-        None => return HashMap::new(),
-    };
-    let path = dir.join(format!("{plugin_name}.toml"));
+fn load_controls(state_dir: &Path, plugin_name: &str) -> HashMap<String, f32> {
+    let path = state_dir.join(format!("{plugin_name}.toml"));
     if !path.exists() {
         return HashMap::new();
     }

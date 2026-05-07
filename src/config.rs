@@ -1,87 +1,128 @@
-use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 /// Top-level configuration for a plugin chain.
-///
-/// Defines the ordered list of plugins and global settings that apply to every
-/// plugin in the chain (e.g. JACK buffer size).
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct ChainConfig {
-    /// Plugins in signal-flow order — audio output of `plugins[i]` is wired to
-    /// the audio input of `plugins[i+1]`.
+    pub name: String,
     pub plugins: Vec<PluginConfig>,
-    /// Prefix used for JACK client names created by the chain (default `"bn"`).
-    #[serde(default = "default_prefix")]
     pub jack_client_prefix: String,
-    /// JACK buffer size override passed to every `jalv` instance (`-b` flag).
     pub buffer_size: Option<u32>,
-    /// Connect first plugin's audio input from system capture (microphone).
-    #[serde(default)]
     pub auto_connect_input: bool,
-    /// Connect last plugin's audio output to system playback (speakers).
-    #[serde(default)]
     pub auto_connect_output: bool,
-    /// Directory for persisting plugin control state across restarts.
-    /// Each plugin's controls are saved to `<state_dir>/<plugin_name>.toml`.
-    pub state_dir: Option<PathBuf>,
 }
 
 /// Configuration for a single LV2 plugin instance.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct PluginConfig {
-    /// LV2 plugin URI (e.g. `"http://calf.sourceforge.net/plugins/Compressor"`).
     pub uri: String,
-    /// JACK client name for this plugin — also used to identify it in the chain.
     pub name: String,
-    /// Initial control port values, keyed by LV2 port symbol.
-    #[serde(default)]
     pub controls: HashMap<String, f32>,
-    /// Directory containing saved plugin state (passed to `jalv -l`).
-    pub state_dir: Option<PathBuf>,
-    /// Whether to show the plugin's native UI (default `true`).
-    /// When `false`, jalv uses a generic fallback UI.
-    #[serde(default = "default_true")]
     pub show_ui: bool,
-    /// Override MIDI input detection. When `true`, the chain always creates a
-    /// MIDI route to this plugin. When `false`, never. When absent, the chain
-    /// auto-detects by querying JACK port types.
-    ///
-    /// Set this explicitly for plugins whose MIDI ports don't contain "midi" in
-    /// the name (e.g. DrumGizmo exposes `control`).
+    /// Override MIDI input detection. When `Some(true)`, the chain always
+    /// creates a MIDI route to this plugin. When `Some(false)`, never.
+    /// When `None`, auto-detects via JACK port types.
     pub midi_in: Option<bool>,
 }
 
-fn default_prefix() -> String {
-    "bn".to_string()
+pub struct ChainBuilder {
+    name: String,
+    plugins: Vec<PluginConfig>,
+    jack_client_prefix: String,
+    buffer_size: Option<u32>,
+    auto_connect_input: bool,
+    auto_connect_output: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
-
-impl Default for ChainConfig {
-    fn default() -> Self {
+impl ChainBuilder {
+    pub fn new(name: impl Into<String>) -> Self {
         Self {
+            name: name.into(),
             plugins: Vec::new(),
-            jack_client_prefix: default_prefix(),
+            jack_client_prefix: "bn".into(),
             buffer_size: None,
             auto_connect_input: false,
             auto_connect_output: false,
-            state_dir: None,
+        }
+    }
+
+    pub fn plugin(mut self, plugin: PluginConfig) -> Self {
+        self.plugins.push(plugin);
+        self
+    }
+
+    pub fn jack_client_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.jack_client_prefix = prefix.into();
+        self
+    }
+
+    pub fn buffer_size(mut self, size: u32) -> Self {
+        self.buffer_size = Some(size);
+        self
+    }
+
+    pub fn auto_connect_input(mut self) -> Self {
+        self.auto_connect_input = true;
+        self
+    }
+
+    pub fn auto_connect_output(mut self) -> Self {
+        self.auto_connect_output = true;
+        self
+    }
+
+    pub fn build(self) -> ChainConfig {
+        ChainConfig {
+            name: self.name,
+            plugins: self.plugins,
+            jack_client_prefix: self.jack_client_prefix,
+            buffer_size: self.buffer_size,
+            auto_connect_input: self.auto_connect_input,
+            auto_connect_output: self.auto_connect_output,
         }
     }
 }
 
-impl Default for PluginConfig {
-    fn default() -> Self {
+pub struct PluginBuilder {
+    uri: String,
+    name: String,
+    controls: HashMap<String, f32>,
+    show_ui: bool,
+    midi_in: Option<bool>,
+}
+
+impl PluginBuilder {
+    pub fn new(uri: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
-            uri: String::new(),
-            name: String::new(),
+            uri: uri.into(),
+            name: name.into(),
             controls: HashMap::new(),
-            state_dir: None,
             show_ui: true,
             midi_in: None,
+        }
+    }
+
+    pub fn control(mut self, symbol: impl Into<String>, value: f32) -> Self {
+        self.controls.insert(symbol.into(), value);
+        self
+    }
+
+    pub fn hide_ui(mut self) -> Self {
+        self.show_ui = false;
+        self
+    }
+
+    pub fn midi_in(mut self, enabled: bool) -> Self {
+        self.midi_in = Some(enabled);
+        self
+    }
+
+    pub fn build(self) -> PluginConfig {
+        PluginConfig {
+            uri: self.uri,
+            name: self.name,
+            controls: self.controls,
+            show_ui: self.show_ui,
+            midi_in: self.midi_in,
         }
     }
 }

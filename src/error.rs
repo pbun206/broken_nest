@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 /// Errors that can occur while building or running a plugin chain.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -26,9 +24,6 @@ pub enum Error {
 
     #[error("config error: {0}")]
     Config(String),
-
-    #[error("state directory does not exist: {0}")]
-    StateDirMissing(PathBuf),
 
     #[error("pw-link command failed: {0}")]
     PwLink(String),

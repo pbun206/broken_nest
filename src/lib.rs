@@ -1,4 +1,4 @@
-//! **broken_nest** — stateless LV2 plugin chain host built on top of
+//! **broken_nest** — LV2 plugin chain host built on top of
 //! [jalv](https://gitlab.com/drobilla/jalv).
 //!
 //! Spawns one `jalv` process per plugin, wires their audio ports together via
@@ -7,24 +7,23 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use broken_nest::{Chain, ChainConfig, PluginConfig};
+//! use broken_nest::{Chain, ChainBuilder, PluginBuilder};
 //!
-//! let config = ChainConfig {
-//!     plugins: vec![
-//!         PluginConfig {
-//!             uri: "http://calf.sourceforge.net/plugins/Compressor".into(),
-//!             name: "comp".into(),
-//!             ..Default::default()
-//!         },
-//!         PluginConfig {
-//!             uri: "http://calf.sourceforge.net/plugins/Equalizer5Band".into(),
-//!             name: "eq".into(),
-//!             ..Default::default()
-//!         },
-//!     ],
-//!     auto_connect_output: true,
-//!     ..Default::default()
-//! };
+//! let config = ChainBuilder::new("my-rig")
+//!     .plugin(
+//!         PluginBuilder::new(
+//!             "http://calf.sourceforge.net/plugins/Compressor",
+//!             "comp",
+//!         ).build()
+//!     )
+//!     .plugin(
+//!         PluginBuilder::new(
+//!             "http://calf.sourceforge.net/plugins/Equalizer5Band",
+//!             "eq",
+//!         ).build()
+//!     )
+//!     .auto_connect_output()
+//!     .build();
 //!
 //! let mut chain = Chain::start(&config).unwrap();
 //!
@@ -45,6 +44,6 @@ pub mod midi;
 mod jalv;
 
 pub use chain::Chain;
-pub use config::{ChainConfig, PluginConfig};
+pub use config::{ChainBuilder, ChainConfig, PluginBuilder, PluginConfig};
 pub use error::Error;
 pub use midi::{MidiEvent, MidiSender};
