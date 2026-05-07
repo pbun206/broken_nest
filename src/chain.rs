@@ -402,7 +402,7 @@ fn auto_connect_chain(chain_client: &str, direction: PortDirection) -> Result<()
                 jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
             );
             let chain_ins = wait_for_client_ports(
-                &jc, chain_client, "32 bit float mono audio", jack::PortFlags::IS_INPUT,
+                &jc, chain_client, None, jack::PortFlags::IS_INPUT,
             )?;
             try_link_pairs_jack(&jc, &capture_ports, &chain_ins)
         }
@@ -413,7 +413,7 @@ fn auto_connect_chain(chain_client: &str, direction: PortDirection) -> Result<()
                 jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
             );
             let chain_outs = wait_for_client_ports(
-                &jc, chain_client, "32 bit float mono audio", jack::PortFlags::IS_OUTPUT,
+                &jc, chain_client, None, jack::PortFlags::IS_OUTPUT,
             )?;
             try_link_pairs_jack(&jc, &chain_outs, &playback_ports)
         }
@@ -456,20 +456,21 @@ const PORT_WAIT_POLL_MS: u64 = 50;
 fn wait_for_client_ports(
     jc: &jack::Client,
     client_name: &str,
-    port_type: &str,
+    port_type: Option<&str>,
     flags: jack::PortFlags,
 ) -> Result<Vec<String>, Error> {
     let pattern = format!("^{client_name}:");
     let deadline = Instant::now() + Duration::from_millis(PORT_WAIT_TIMEOUT_MS);
 
     loop {
-        let ports = jc.ports(Some(&pattern), Some(port_type), flags);
+        let ports = jc.ports(Some(&pattern), port_type, flags);
         if !ports.is_empty() {
             return Ok(ports);
         }
         if Instant::now() >= deadline {
             return Err(Error::Wiring(format!(
-                "timeout waiting for {port_type} ports from {client_name}"
+                "timeout waiting for {} ports from {client_name}",
+                port_type.unwrap_or("audio"),
             )));
         }
         thread::sleep(Duration::from_millis(PORT_WAIT_POLL_MS));
@@ -481,10 +482,10 @@ fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
         .map_err(|e| Error::Wiring(format!("JACK client for wiring failed: {e}")))?;
 
     let audio_outs = wait_for_client_ports(
-        &jc, from, "32 bit float mono audio", jack::PortFlags::IS_OUTPUT,
+        &jc, from, None, jack::PortFlags::IS_OUTPUT,
     )?;
     let audio_ins = wait_for_client_ports(
-        &jc, to, "32 bit float mono audio", jack::PortFlags::IS_INPUT,
+        &jc, to, None, jack::PortFlags::IS_INPUT,
     )?;
 
     for (src, dst) in audio_outs.iter().zip(audio_ins.iter()) {
