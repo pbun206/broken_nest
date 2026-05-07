@@ -25,9 +25,6 @@ pub enum Error {
     #[error("config error: {0}")]
     Config(String),
 
-    #[error("pw-link command failed: {0}")]
-    PwLink(String),
-
     #[error("expected exactly one MIDI plugin, found {count}")]
     AmbiguousMidi { count: usize },
 

@@ -2,9 +2,8 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::ChainConfig;
 use crate::error::Error;
@@ -16,7 +15,7 @@ const MIDI_RING_CAPACITY: usize = 1024;
 /// A running chain of LV2 plugins wired in series.
 ///
 /// Each plugin runs as a separate `jalv` process. Audio ports are connected
-/// left-to-right via `pw-link`. If any plugin exposes MIDI input, a dedicated
+/// left-to-right via the JACK API. If any plugin exposes MIDI input, a dedicated
 /// JACK client is created to route [`MidiEvent`](crate::MidiEvent)s from
 /// user code into the corresponding plugin.
 ///
@@ -51,8 +50,6 @@ impl Chain {
             let instance = JalvInstance::spawn(plugin, config.buffer_size, mode, &saved)?;
             instances.push(instance);
         }
-
-        thread::sleep(Duration::from_millis(500));
 
         // Wire adjacent plugins (audio)
         for i in 0..instances.len() - 1 {
@@ -212,20 +209,28 @@ impl Chain {
         self.instances.iter_mut().all(|i| i.is_running())
     }
 
-    /// JACK port names for the first plugin's stereo audio input.
-    pub fn chain_input_ports(&self) -> Option<(String, String)> {
-        self.instances.first().map(|i| {
-            let name = i.jack_client_name();
-            (format!("{name}:in_l"), format!("{name}:in_r"))
-        })
+    /// JACK port names for the first plugin's audio inputs.
+    pub fn chain_input_ports(&self) -> Option<Vec<String>> {
+        let name = self.instances.first()?.jack_client_name();
+        let (jc, _) = jack::Client::new("bn-query", jack::ClientOptions::NO_START_SERVER).ok()?;
+        let ports = jc.ports(
+            Some(&format!("^{name}:")),
+            Some("32 bit float mono audio"),
+            jack::PortFlags::IS_INPUT,
+        );
+        if ports.is_empty() { None } else { Some(ports) }
     }
 
-    /// JACK port names for the last plugin's stereo audio output.
-    pub fn chain_output_ports(&self) -> Option<(String, String)> {
-        self.instances.last().map(|i| {
-            let name = i.jack_client_name();
-            (format!("{name}:out_l"), format!("{name}:out_r"))
-        })
+    /// JACK port names for the last plugin's audio outputs.
+    pub fn chain_output_ports(&self) -> Option<Vec<String>> {
+        let name = self.instances.last()?.jack_client_name();
+        let (jc, _) = jack::Client::new("bn-query", jack::ClientOptions::NO_START_SERVER).ok()?;
+        let ports = jc.ports(
+            Some(&format!("^{name}:")),
+            Some("32 bit float mono audio"),
+            jack::PortFlags::IS_OUTPUT,
+        );
+        if ports.is_empty() { None } else { Some(ports) }
     }
 
     /// Snapshot of control values for all plugins.
@@ -250,8 +255,6 @@ impl Chain {
         let plugin = &self.config.plugins[idx];
         let instance = JalvInstance::spawn(plugin, self.config.buffer_size, mode, &controls)?;
         self.instances[idx] = instance;
-
-        thread::sleep(Duration::from_millis(500));
 
         // Rewire audio: previous plugin → this → next plugin
         if idx > 0 {
@@ -475,15 +478,51 @@ fn try_link_pairs_jack(
 
 // --- Port wiring ---
 
+const PORT_WAIT_TIMEOUT_MS: u64 = 3000;
+const PORT_WAIT_POLL_MS: u64 = 50;
+
+fn wait_for_client_ports(
+    jc: &jack::Client,
+    client_name: &str,
+    port_type: &str,
+    flags: jack::PortFlags,
+) -> Result<Vec<String>, Error> {
+    let pattern = format!("^{client_name}:");
+    let deadline = Instant::now() + Duration::from_millis(PORT_WAIT_TIMEOUT_MS);
+
+    loop {
+        let ports = jc.ports(Some(&pattern), Some(port_type), flags);
+        if !ports.is_empty() {
+            return Ok(ports);
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Wiring(format!(
+                "timeout waiting for {port_type} ports from {client_name}"
+            )));
+        }
+        thread::sleep(Duration::from_millis(PORT_WAIT_POLL_MS));
+    }
+}
+
 fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
-    let out_ports = get_ports(from, PortDirection::Output)?;
-    let in_ports = get_ports(to, PortDirection::Input)?;
+    let (jc, _) = jack::Client::new("bn-wire-audio", jack::ClientOptions::NO_START_SERVER)
+        .map_err(|e| Error::Wiring(format!("JACK client for wiring failed: {e}")))?;
 
-    let audio_outs: Vec<_> = out_ports.iter().filter(|p| is_audio_port(p)).collect();
-    let audio_ins: Vec<_> = in_ports.iter().filter(|p| is_audio_port(p)).collect();
+    let audio_outs = wait_for_client_ports(
+        &jc, from, "32 bit float mono audio", jack::PortFlags::IS_OUTPUT,
+    )?;
+    let audio_ins = wait_for_client_ports(
+        &jc, to, "32 bit float mono audio", jack::PortFlags::IS_INPUT,
+    )?;
 
-    for (out, inp) in audio_outs.iter().zip(audio_ins.iter()) {
-        pw_link(out, inp)?;
+    for (src, dst) in audio_outs.iter().zip(audio_ins.iter()) {
+        match jc.connect_ports_by_name(src, dst) {
+            Ok(()) => log::debug!("linked: {src} → {dst}"),
+            Err(jack::Error::PortAlreadyConnected(_, _)) => {}
+            Err(e) => {
+                return Err(Error::Wiring(format!("connect {src} → {dst} failed: {e}")));
+            }
+        }
     }
 
     Ok(())
@@ -493,58 +532,6 @@ fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
 enum PortDirection {
     Output,
     Input,
-}
-
-fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Error> {
-    let flag = match direction {
-        PortDirection::Output => "-o",
-        PortDirection::Input => "-i",
-    };
-
-    let mut attempts = 0;
-    loop {
-        let output = Command::new("pw-link")
-            .arg(flag)
-            .output()
-            .map_err(|e| Error::PwLink(format!("failed to run pw-link: {e}")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ports: Vec<String> = stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| l.starts_with(client))
-            .collect();
-
-        if !ports.is_empty() || attempts >= 10 {
-            return Ok(ports);
-        }
-
-        attempts += 1;
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn pw_link(from: &str, to: &str) -> Result<(), Error> {
-    let output = Command::new("pw-link")
-        .arg(from)
-        .arg(to)
-        .output()
-        .map_err(|e| Error::PwLink(format!("failed to run pw-link: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::PwLink(format!(
-            "pw-link {from} → {to} failed: {stderr}"
-        )));
-    }
-
-    log::debug!("linked: {from} → {to}");
-    Ok(())
-}
-
-fn is_audio_port(port: &str) -> bool {
-    let lower = port.to_lowercase();
-    !lower.contains("midi") && !lower.contains("event") && !lower.contains("control")
 }
 
 fn is_midi_port(port: &str) -> bool {
@@ -557,8 +544,8 @@ fn has_midi_input(client: &str) -> bool {
     let (jc, _) = match probe {
         Ok(c) => c,
         Err(_) => {
-            log::warn!("JACK probe failed, falling back to port-name heuristic for {client}");
-            return has_midi_input_heuristic(client);
+            log::warn!("JACK probe failed for MIDI detection on {client}");
+            return false;
         }
     };
     let prefix = format!("{client}:");
@@ -566,15 +553,9 @@ fn has_midi_input(client: &str) -> bool {
     midi_ins.iter().any(|p| p.starts_with(&prefix))
 }
 
-fn has_midi_input_heuristic(client: &str) -> bool {
-    get_ports(client, PortDirection::Input)
-        .map(|ports| ports.iter().any(|p| is_midi_port(p)))
-        .unwrap_or(false)
-}
-
 fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
-    let (jc, _) = jack::Client::new("bn-wire", jack::ClientOptions::NO_START_SERVER)
-        .map_err(|e| Error::Wiring(format!("JACK probe for MIDI wiring failed: {e}")))?;
+    let (jc, _) = jack::Client::new("bn-wire-midi", jack::ClientOptions::NO_START_SERVER)
+        .map_err(|e| Error::Wiring(format!("JACK client for MIDI wiring failed: {e}")))?;
 
     let router_prefix = format!("{router_client}:");
     let target_prefix = format!("{target_client}:");
@@ -590,7 +571,15 @@ fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
         .find(|p| p.starts_with(&target_prefix));
 
     if let (Some(out), Some(inp)) = (router_port, target_port) {
-        pw_link(out, inp)?;
+        match jc.connect_ports_by_name(out, inp) {
+            Ok(()) => log::debug!("linked midi: {out} → {inp}"),
+            Err(jack::Error::PortAlreadyConnected(_, _)) => {}
+            Err(e) => {
+                return Err(Error::Wiring(format!(
+                    "midi connect {out} → {inp} failed: {e}"
+                )));
+            }
+        }
     }
 
     Ok(())
