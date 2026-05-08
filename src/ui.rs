@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use crate::error::Error;
 
-const GTK3_UI_URI: &str = "http://lv2plug.in/ns/extensions/ui#GtkUI";
-const GTK3_CONTAINER_URI: &str = "http://lv2plug.in/ns/extensions/ui#Gtk3UI";
-const X11_UI_URI: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
+const LV2_UI_GTK_URI: &str = "http://lv2plug.in/ns/extensions/ui#GtkUI";
+const LV2_UI_GTK3_URI: &str = "http://lv2plug.in/ns/extensions/ui#Gtk3UI";
+const LV2_UI_X11_URI: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
 
 // ─── suil FFI ──────────────────────────────────────────────────────
 
@@ -95,43 +95,58 @@ pub(crate) fn discover_ui(
     let plugin = plugins.plugin(&uri_node)?;
     let uis = plugin.uis()?;
 
-    let gtk3_node = world.new_uri(GTK3_UI_URI);
-    let x11_node = world.new_uri(X11_UI_URI);
+    let gtk2_node = world.new_uri(LV2_UI_GTK_URI);
+    let gtk3_node = world.new_uri(LV2_UI_GTK3_URI);
+    let x11_node = world.new_uri(LV2_UI_X11_URI);
+
+    // Prefer Gtk3UI > GtkUI > X11UI
+    let mut best: Option<(lilv::ui::UI, &str)> = None;
+    let mut best_priority = 0u8;
 
     for ui in uis.iter() {
-        let is_gtk3 = ui.is_a(&gtk3_node);
-        let is_x11 = ui.is_a(&x11_node);
-
-        if !is_gtk3 && !is_x11 {
+        let (ui_type, priority) = if ui.is_a(&gtk3_node) {
+            (LV2_UI_GTK3_URI, 3)
+        } else if ui.is_a(&gtk2_node) {
+            (LV2_UI_GTK_URI, 2)
+        } else if ui.is_a(&x11_node) {
+            (LV2_UI_X11_URI, 1)
+        } else {
             continue;
+        };
+
+        if priority > best_priority {
+            best = Some((ui, ui_type));
+            best_priority = priority;
         }
-
-        let ui_type = if is_gtk3 { GTK3_UI_URI } else { X11_UI_URI };
-
-        let ui_uri_str = ui.uri().as_str()?.to_owned();
-        let bundle = ui.bundle_uri()?.as_str()?.to_owned();
-        let binary = ui.binary_uri()?.as_str()?.to_owned();
-
-        let bundle_path = uri_to_path(&bundle)?;
-        let binary_path = uri_to_path(&binary)?;
-
-        let mut sym_map = HashMap::new();
-        for (sym, idx) in port_infos {
-            sym_map.insert(sym.clone(), *idx);
-        }
-
-        return Some(PluginUiInfo {
-            plugin_name: plugin_name.to_owned(),
-            plugin_uri: CString::new(plugin_uri_str).ok()?,
-            ui_uri: CString::new(ui_uri_str).ok()?,
-            ui_type_uri: CString::new(ui_type).ok()?,
-            ui_bundle_path: CString::new(bundle_path).ok()?,
-            ui_binary_path: CString::new(binary_path).ok()?,
-            port_symbol_to_index: sym_map,
-            control_port_indices: control_port_indices.to_vec(),
-        });
     }
-    None
+
+    let (ui, ui_type) = best?;
+    let ui_uri_str = ui.uri().as_str()?.to_owned();
+    let bundle = ui.bundle_uri()?.as_str()?.to_owned();
+    let binary = ui.binary_uri()?.as_str()?.to_owned();
+
+    let bundle_path = uri_to_path(&bundle)?;
+    let binary_path = uri_to_path(&binary)?;
+
+    let mut sym_map = HashMap::new();
+    for (sym, idx) in port_infos {
+        sym_map.insert(sym.clone(), *idx);
+    }
+
+    log::debug!(
+        "UI for '{plugin_name}': type={ui_type}, uri={ui_uri_str}"
+    );
+
+    Some(PluginUiInfo {
+        plugin_name: plugin_name.to_owned(),
+        plugin_uri: CString::new(plugin_uri_str).ok()?,
+        ui_uri: CString::new(ui_uri_str).ok()?,
+        ui_type_uri: CString::new(ui_type).ok()?,
+        ui_bundle_path: CString::new(bundle_path).ok()?,
+        ui_binary_path: CString::new(binary_path).ok()?,
+        port_symbol_to_index: sym_map,
+        control_port_indices: control_port_indices.to_vec(),
+    })
 }
 
 fn uri_to_path(uri: &str) -> Option<String> {
@@ -225,138 +240,151 @@ mod gtk_thread {
         pub fn start() -> Self {
             let (tx, rx) = glib::MainContext::channel(glib::Priority::DEFAULT);
 
-            let thread = std::thread::spawn(move || {
-                if gtk::init().is_err() {
-                    log::error!("GTK init failed");
-                    return;
-                }
+            let thread = std::thread::Builder::new()
+                .name("broken_nest-gtk".into())
+                .spawn(move || {
+                    if gtk::init().is_err() {
+                        log::error!("GTK init failed on UI thread");
+                        return;
+                    }
 
-                let mut live_uis: HashMap<String, LiveUi> = HashMap::new();
+                    let mut live_uis: HashMap<String, LiveUi> = HashMap::new();
 
-                rx.attach(None, move |cmd: UiCommand| {
-                    match cmd {
-                        UiCommand::Show {
-                            info,
-                            control_bridge,
-                            features_ptr,
-                        } => {
-                            if live_uis.contains_key(&info.plugin_name) {
-                                if let Some(ui) = live_uis.get(&info.plugin_name) {
-                                    ui.window.present();
-                                }
-                                return glib::ControlFlow::Continue;
-                            }
-
-                            let name = info.plugin_name.clone();
-                            let controller = Box::new(UiController {
+                    rx.attach(None, move |cmd: UiCommand| {
+                        match cmd {
+                            UiCommand::Show {
                                 info,
                                 control_bridge,
-                            });
-
-                            let host = unsafe {
-                                suil_host_new(
-                                    port_write_callback,
-                                    port_index_callback,
-                                    ptr::null(),
-                                    ptr::null(),
-                                )
-                            };
-
-                            if host.is_null() {
-                                log::error!("suil_host_new failed for '{name}'");
-                                return glib::ControlFlow::Continue;
-                            }
-
-                            let ctrl_ptr =
-                                &*controller as *const UiController as *mut c_void;
-
-                            let container_uri =
-                                CString::new(GTK3_CONTAINER_URI).unwrap();
-
-                            let instance = unsafe {
-                                suil_instance_new(
-                                    host,
-                                    ctrl_ptr,
-                                    container_uri.as_ptr(),
-                                    controller.info.plugin_uri.as_ptr(),
-                                    controller.info.ui_uri.as_ptr(),
-                                    controller.info.ui_type_uri.as_ptr(),
-                                    controller.info.ui_bundle_path.as_ptr(),
-                                    controller.info.ui_binary_path.as_ptr(),
-                                    features_ptr,
-                                )
-                            };
-
-                            if instance.is_null() {
-                                log::error!("suil_instance_new failed for '{name}'");
-                                unsafe { suil_host_free(host) };
-                                return glib::ControlFlow::Continue;
-                            }
-
-                            let widget_ptr =
-                                unsafe { suil_instance_get_widget(instance) };
-
-                            if widget_ptr.is_null() {
-                                log::error!("suil widget is null for '{name}'");
-                                unsafe {
-                                    suil_instance_free(instance);
-                                    suil_host_free(host);
+                                features_ptr,
+                            } => {
+                                if live_uis.contains_key(&info.plugin_name) {
+                                    if let Some(ui) = live_uis.get(&info.plugin_name) {
+                                        ui.window.present();
+                                    }
+                                    return glib::ControlFlow::Continue;
                                 }
-                                return glib::ControlFlow::Continue;
-                            }
 
-                            use gtk::prelude::*;
+                                let name = info.plugin_name.clone();
+                                let controller = Box::new(UiController {
+                                    info,
+                                    control_bridge,
+                                });
 
-                            let widget: gtk::Widget =
-                                unsafe { gtk::glib::translate::from_glib_none(widget_ptr as *mut _) };
+                                let host = unsafe {
+                                    suil_host_new(
+                                        port_write_callback,
+                                        port_index_callback,
+                                        ptr::null(),
+                                        ptr::null(),
+                                    )
+                                };
 
-                            let window = gtk::Window::new(gtk::WindowType::Toplevel);
-                            window.set_title(&name);
-                            window.add(&widget);
-                            window.show_all();
+                                if host.is_null() {
+                                    log::error!("suil_host_new failed for '{name}'");
+                                    return glib::ControlFlow::Continue;
+                                }
 
-                            let name_clone = name.clone();
-                            window.connect_delete_event(move |w, _| {
-                                w.hide();
-                                glib::Propagation::Stop
-                            });
+                                let ctrl_ptr =
+                                    &*controller as *const UiController as *mut c_void;
 
-                            live_uis.insert(
-                                name,
-                                LiveUi {
-                                    suil_host: host,
-                                    suil_instance: instance,
-                                    window,
-                                    _controller: controller,
-                                },
-                            );
-                        }
-                        UiCommand::Hide { plugin_name } => {
-                            if let Some(ui) = live_uis.remove(&plugin_name) {
+                                // Always present GTK3 as container — suil wraps
+                                // GTK2→GTK3 transparently if the suil module is
+                                // installed (suil-gtk2-in-gtk3).
+                                let container_uri =
+                                    CString::new(LV2_UI_GTK3_URI).unwrap();
+
+                                let instance = unsafe {
+                                    suil_instance_new(
+                                        host,
+                                        ctrl_ptr,
+                                        container_uri.as_ptr(),
+                                        controller.info.plugin_uri.as_ptr(),
+                                        controller.info.ui_uri.as_ptr(),
+                                        controller.info.ui_type_uri.as_ptr(),
+                                        controller.info.ui_bundle_path.as_ptr(),
+                                        controller.info.ui_binary_path.as_ptr(),
+                                        features_ptr,
+                                    )
+                                };
+
+                                if instance.is_null() {
+                                    log::error!(
+                                        "suil_instance_new failed for '{name}' \
+                                         (ui_type={})",
+                                        controller.info.ui_type_uri.to_str().unwrap_or("?")
+                                    );
+                                    unsafe { suil_host_free(host) };
+                                    return glib::ControlFlow::Continue;
+                                }
+
+                                let widget_ptr =
+                                    unsafe { suil_instance_get_widget(instance) };
+
+                                if widget_ptr.is_null() {
+                                    log::error!("suil widget is null for '{name}'");
+                                    unsafe {
+                                        suil_instance_free(instance);
+                                        suil_host_free(host);
+                                    }
+                                    return glib::ControlFlow::Continue;
+                                }
+
                                 use gtk::prelude::*;
-                                ui.window.hide();
-                                unsafe {
-                                    suil_instance_free(ui.suil_instance);
-                                    suil_host_free(ui.suil_host);
-                                }
-                            }
-                        }
-                        UiCommand::Shutdown => {
-                            for (_, ui) in live_uis.drain() {
-                                unsafe {
-                                    suil_instance_free(ui.suil_instance);
-                                    suil_host_free(ui.suil_host);
-                                }
-                            }
-                            gtk::main_quit();
-                            return glib::ControlFlow::Break;
-                        }
-                    }
-                    glib::ControlFlow::Continue
-                });
 
-                gtk::main();
-            });
+                                let widget: gtk::Widget = unsafe {
+                                    gtk::glib::translate::from_glib_none(
+                                        widget_ptr as *mut _,
+                                    )
+                                };
+
+                                let window =
+                                    gtk::Window::new(gtk::WindowType::Toplevel);
+                                window.set_title(&name);
+                                window.add(&widget);
+                                window.show_all();
+
+                                window.connect_delete_event(move |w, _| {
+                                    w.hide();
+                                    glib::Propagation::Stop
+                                });
+
+                                live_uis.insert(
+                                    name,
+                                    LiveUi {
+                                        suil_host: host,
+                                        suil_instance: instance,
+                                        window,
+                                        _controller: controller,
+                                    },
+                                );
+                            }
+                            UiCommand::Hide { plugin_name } => {
+                                if let Some(ui) = live_uis.remove(&plugin_name) {
+                                    use gtk::prelude::*;
+                                    ui.window.hide();
+                                    unsafe {
+                                        suil_instance_free(ui.suil_instance);
+                                        suil_host_free(ui.suil_host);
+                                    }
+                                }
+                            }
+                            UiCommand::Shutdown => {
+                                for (_, ui) in live_uis.drain() {
+                                    unsafe {
+                                        suil_instance_free(ui.suil_instance);
+                                        suil_host_free(ui.suil_host);
+                                    }
+                                }
+                                gtk::main_quit();
+                                return glib::ControlFlow::Break;
+                            }
+                        }
+                        glib::ControlFlow::Continue
+                    });
+
+                    gtk::main();
+                })
+                .expect("failed to spawn GTK UI thread");
 
             Self {
                 tx,
