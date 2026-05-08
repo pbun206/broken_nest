@@ -29,7 +29,7 @@ pub struct JalvInstance {
 impl JalvInstance {
     /// Spawn a jalv process for the given plugin configuration.
     ///
-    /// `mode` selects between headless (`jalv`) and GUI (`jalv.gtk3`).
+    /// `mode` selects between headless (offscreen GDK) and GUI (X11 window).
     /// `initial_controls` are extra `-c` flags beyond what's in `plugin.controls`
     /// (used to restore saved state).
     pub fn spawn(
@@ -38,14 +38,12 @@ impl JalvInstance {
         mode: UiMode,
         initial_controls: &HashMap<String, f32>,
     ) -> Result<Self, Error> {
-        let binary = match mode {
-            UiMode::Headless => "jalv",
-            UiMode::Gtk => "jalv.gtk3",
+        let mut cmd = Command::new("jalv.gtk3");
+
+        match mode {
+            UiMode::Headless => { cmd.env("GDK_BACKEND", "offscreen"); }
+            UiMode::Gtk => { cmd.env("GDK_BACKEND", "x11"); }
         };
-
-        let mut cmd = Command::new(binary);
-
-        cmd.env("GDK_BACKEND", "x11");
         cmd.arg("-n").arg(&plugin.name);
         cmd.arg("--print-controls");
 

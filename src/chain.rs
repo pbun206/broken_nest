@@ -140,7 +140,7 @@ impl Chain {
         Ok(self.midi_senders.values_mut().next().unwrap())
     }
 
-    /// Show the plugin UI window. Respawns as `jalv.gtk3` if currently headless.
+    /// Show the plugin UI window. Respawns with X11 GDK backend if currently headless.
     /// Brief audio gap (~1s) during respawn.
     pub fn show_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
         let idx = self.find_plugin_idx(plugin_name)?;
@@ -152,7 +152,7 @@ impl Chain {
         self.respawn_plugin(idx, UiMode::Gtk)
     }
 
-    /// Hide the plugin UI window. Respawns as headless `jalv`.
+    /// Hide the plugin UI window. Respawns with offscreen GDK backend.
     /// Brief audio gap (~1s) during respawn.
     pub fn hide_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
         let idx = self.find_plugin_idx(plugin_name)?;
