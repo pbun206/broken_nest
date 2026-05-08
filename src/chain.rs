@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::config::ChainConfig;
 use crate::error::Error;
@@ -209,28 +210,20 @@ impl Chain {
         self.instances.iter_mut().all(|i| i.is_running())
     }
 
-    /// JACK port names for the first plugin's audio inputs.
+    /// Port names for the first plugin's audio inputs.
     pub fn chain_input_ports(&self) -> Option<Vec<String>> {
         let name = self.instances.first()?.jack_client_name();
-        let (jc, _) = jack::Client::new("bn-query", jack::ClientOptions::NO_START_SERVER).ok()?;
-        let ports = jc.ports(
-            Some(&format!("^{name}:")),
-            None,
-            jack::PortFlags::IS_INPUT,
-        );
-        if ports.is_empty() { None } else { Some(ports) }
+        let ports = get_ports(name, PortDirection::Input).ok()?;
+        let audio: Vec<_> = ports.into_iter().filter(|p| is_audio_port(p)).collect();
+        if audio.is_empty() { None } else { Some(audio) }
     }
 
-    /// JACK port names for the last plugin's audio outputs.
+    /// Port names for the last plugin's audio outputs.
     pub fn chain_output_ports(&self) -> Option<Vec<String>> {
         let name = self.instances.last()?.jack_client_name();
-        let (jc, _) = jack::Client::new("bn-query", jack::ClientOptions::NO_START_SERVER).ok()?;
-        let ports = jc.ports(
-            Some(&format!("^{name}:")),
-            None,
-            jack::PortFlags::IS_OUTPUT,
-        );
-        if ports.is_empty() { None } else { Some(ports) }
+        let ports = get_ports(name, PortDirection::Output).ok()?;
+        let audio: Vec<_> = ports.into_iter().filter(|p| is_audio_port(p)).collect();
+        if audio.is_empty() { None } else { Some(audio) }
     }
 
     /// Snapshot of control values for all plugins.
@@ -372,7 +365,7 @@ fn load_controls(state_dir: &Path, plugin_name: &str) -> HashMap<String, f32> {
     }
 }
 
-// --- Auto-connect ---
+// --- Auto-connect (pw-link) ---
 
 fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), Error> {
     if config.auto_connect_input {
@@ -391,131 +384,136 @@ fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), 
 }
 
 fn auto_connect_chain(chain_client: &str, direction: PortDirection) -> Result<(), Error> {
-    let (jc, _) = jack::Client::new("bn-autoconnect", jack::ClientOptions::NO_START_SERVER)
-        .map_err(|e| Error::Wiring(format!("JACK client for auto-connect failed: {e}")))?;
-
     log::debug!("auto-connect {chain_client} direction={direction:?}");
 
     match direction {
         PortDirection::Input => {
-            let capture_ports = jc.ports(
-                None,
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_OUTPUT | jack::PortFlags::IS_PHYSICAL,
-            );
+            let capture_ports = get_physical_ports(PortDirection::Output)?;
             log::debug!("physical capture ports: {capture_ports:?}");
-            let chain_ins = wait_for_client_ports(
-                &jc, chain_client, None, jack::PortFlags::IS_INPUT,
-            )?;
-            log::debug!("chain input ports: {chain_ins:?}");
-            try_link_pairs_jack(&jc, &capture_ports, &chain_ins)
+            let chain_ins = get_ports(chain_client, PortDirection::Input)?;
+            let audio_ins: Vec<_> = chain_ins.into_iter().filter(|p| is_audio_port(p)).collect();
+            log::debug!("chain audio input ports: {audio_ins:?}");
+            for (src, dst) in capture_ports.iter().zip(audio_ins.iter()) {
+                pw_link(src, dst)?;
+            }
+            Ok(())
         }
         PortDirection::Output => {
-            let playback_ports = jc.ports(
-                None,
-                Some("32 bit float mono audio"),
-                jack::PortFlags::IS_INPUT | jack::PortFlags::IS_PHYSICAL,
-            );
+            let playback_ports = get_physical_ports(PortDirection::Input)?;
             log::debug!("physical playback ports: {playback_ports:?}");
-            let chain_outs = wait_for_client_ports(
-                &jc, chain_client, None, jack::PortFlags::IS_OUTPUT,
-            )?;
-            log::debug!("chain output ports: {chain_outs:?}");
-            try_link_pairs_jack(&jc, &chain_outs, &playback_ports)
+            let chain_outs = get_ports(chain_client, PortDirection::Output)?;
+            let audio_outs: Vec<_> = chain_outs.into_iter().filter(|p| is_audio_port(p)).collect();
+            log::debug!("chain audio output ports: {audio_outs:?}");
+            for (src, dst) in audio_outs.iter().zip(playback_ports.iter()) {
+                pw_link(src, dst)?;
+            }
+            Ok(())
         }
     }
 }
 
-fn try_link_pairs_jack(
-    jc: &jack::Client,
-    sources: &[String],
-    destinations: &[String],
-) -> Result<(), Error> {
-    if sources.is_empty() || destinations.is_empty() {
+// --- Port wiring (pw-link) ---
+
+const PORT_POLL_ATTEMPTS: u32 = 15;
+const PORT_POLL_INTERVAL_MS: u64 = 200;
+
+fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Error> {
+    let flag = match direction {
+        PortDirection::Output => "-o",
+        PortDirection::Input => "-i",
+    };
+
+    for attempt in 0..PORT_POLL_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(PORT_POLL_INTERVAL_MS));
+        }
+
+        let output = Command::new("pw-link")
+            .arg(flag)
+            .output()
+            .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let ports: Vec<String> = stdout
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.starts_with(client))
+            .collect();
+
+        if !ports.is_empty() {
+            log::debug!("get_ports({client}, {direction:?}): found {ports:?}");
+            return Ok(ports);
+        }
+
+        log::debug!(
+            "get_ports({client}, {direction:?}): attempt {}/{PORT_POLL_ATTEMPTS} — no ports yet",
+            attempt + 1,
+        );
+    }
+
+    Err(Error::Wiring(format!(
+        "timeout waiting for ports from {client} (direction={direction:?})"
+    )))
+}
+
+fn get_physical_ports(direction: PortDirection) -> Result<Vec<String>, Error> {
+    let flag = match direction {
+        PortDirection::Output => "-o",
+        PortDirection::Input => "-i",
+    };
+
+    let output = Command::new("pw-link")
+        .arg(flag)
+        .output()
+        .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let ports: Vec<String> = stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    log::debug!("get_physical_ports({direction:?}): {ports:?}");
+    Ok(ports)
+}
+
+fn pw_link(from: &str, to: &str) -> Result<(), Error> {
+    let output = Command::new("pw-link")
+        .arg(from)
+        .arg(to)
+        .output()
+        .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = stderr.trim();
+        if msg.contains("already linked") {
+            log::debug!("already linked: {from} → {to}");
+            return Ok(());
+        }
         return Err(Error::Wiring(format!(
-            "auto-connect found no linkable ports (sources: {}, destinations: {})",
-            sources.len(),
-            destinations.len(),
+            "pw-link {from} → {to} failed: {msg}"
         )));
     }
 
-    for (src, dst) in sources.iter().zip(destinations.iter()) {
-        match jc.connect_ports_by_name(src, dst) {
-            Ok(()) => {}
-            Err(jack::Error::PortAlreadyConnected(_, _)) => {}
-            Err(e) => {
-                return Err(Error::Wiring(format!(
-                    "jack connect {src} → {dst} failed: {e}"
-                )));
-            }
-        }
-    }
-
+    log::debug!("linked: {from} → {to}");
     Ok(())
-}
-
-// --- Port wiring ---
-
-const PORT_WAIT_TIMEOUT_MS: u64 = 3000;
-const PORT_WAIT_POLL_MS: u64 = 50;
-
-fn wait_for_client_ports(
-    jc: &jack::Client,
-    client_name: &str,
-    port_type: Option<&str>,
-    flags: jack::PortFlags,
-) -> Result<Vec<String>, Error> {
-    let pattern = format!("^{client_name}:");
-    let deadline = Instant::now() + Duration::from_millis(PORT_WAIT_TIMEOUT_MS);
-    let type_label = port_type.unwrap_or("(any)");
-
-    log::debug!("waiting for ports: client={client_name} type={type_label} flags={flags:?}");
-
-    loop {
-        let ports = jc.ports(Some(&pattern), port_type, flags);
-        if !ports.is_empty() {
-            log::debug!("found {} ports from {client_name}: {ports:?}", ports.len());
-            return Ok(ports);
-        }
-        if Instant::now() >= deadline {
-            let all_ports = jc.ports(Some(&pattern), None, jack::PortFlags::empty());
-            log::error!(
-                "timeout waiting for {type_label} ports from {client_name} \
-                 (all ports with that name: {all_ports:?})"
-            );
-            return Err(Error::Wiring(format!(
-                "timeout waiting for {type_label} ports from {client_name}",
-            )));
-        }
-        thread::sleep(Duration::from_millis(PORT_WAIT_POLL_MS));
-    }
 }
 
 fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
     log::debug!("wiring plugins: {from} → {to}");
 
-    let (jc, _) = jack::Client::new("bn-wire-audio", jack::ClientOptions::NO_START_SERVER)
-        .map_err(|e| Error::Wiring(format!("JACK client for wiring failed: {e}")))?;
+    let out_ports = get_ports(from, PortDirection::Output)?;
+    let in_ports = get_ports(to, PortDirection::Input)?;
 
-    let audio_outs = wait_for_client_ports(
-        &jc, from, None, jack::PortFlags::IS_OUTPUT,
-    )?;
-    let audio_ins = wait_for_client_ports(
-        &jc, to, None, jack::PortFlags::IS_INPUT,
-    )?;
+    let audio_outs: Vec<_> = out_ports.iter().filter(|p| is_audio_port(p)).collect();
+    let audio_ins: Vec<_> = in_ports.iter().filter(|p| is_audio_port(p)).collect();
 
     log::debug!("wire_plugins: {} outs × {} ins", audio_outs.len(), audio_ins.len());
 
     for (src, dst) in audio_outs.iter().zip(audio_ins.iter()) {
-        match jc.connect_ports_by_name(src, dst) {
-            Ok(()) => log::debug!("linked: {src} → {dst}"),
-            Err(jack::Error::PortAlreadyConnected(_, _)) => {
-                log::debug!("already linked: {src} → {dst}");
-            }
-            Err(e) => {
-                return Err(Error::Wiring(format!("connect {src} → {dst} failed: {e}")));
-            }
-        }
+        pw_link(src, dst)?;
     }
 
     Ok(())
@@ -527,9 +525,40 @@ enum PortDirection {
     Input,
 }
 
+fn is_audio_port(port: &str) -> bool {
+    let lower = port.to_lowercase();
+    !lower.contains("midi") && !lower.contains("event") && !lower.contains("control")
+}
+
 fn is_midi_port(port: &str) -> bool {
     let lower = port.to_lowercase();
     lower.contains("midi") || lower.contains("event")
+}
+
+fn has_midi_input(client: &str) -> bool {
+    get_ports(client, PortDirection::Input)
+        .map(|ports| ports.iter().any(|p| is_midi_port(p)))
+        .unwrap_or(false)
+}
+
+fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
+    let out_ports = get_ports(router_client, PortDirection::Output)?;
+    let in_ports = get_ports(target_client, PortDirection::Input)?;
+
+    let midi_outs: Vec<_> = out_ports.iter().filter(|p| is_midi_port(p)).collect();
+    let midi_ins: Vec<_> = in_ports.iter().filter(|p| is_midi_port(p)).collect();
+
+    let router_port = midi_outs
+        .iter()
+        .find(|p| p.contains(target_client))
+        .or(midi_outs.first());
+    let target_port = midi_ins.first();
+
+    if let (Some(out), Some(inp)) = (router_port, target_port) {
+        pw_link(out, inp)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -537,7 +566,16 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    // --- is_midi_port ---
+    // --- is_audio_port / is_midi_port ---
+
+    #[test]
+    fn audio_port_detection() {
+        assert!(is_audio_port("synth:audio_out_1"));
+        assert!(is_audio_port("comp:out_l"));
+        assert!(!is_audio_port("synth:midi_in"));
+        assert!(!is_audio_port("synth:event-in"));
+        assert!(!is_audio_port("synth:control_port"));
+    }
 
     #[test]
     fn midi_port_detection() {
@@ -545,7 +583,6 @@ mod tests {
         assert!(is_midi_port("synth:MIDI_IN"));
         assert!(is_midi_port("synth:event-in"));
         assert!(!is_midi_port("synth:audio_out_1"));
-        assert!(!is_midi_port("synth:control"));
     }
 
     // --- state_dir_for ---
@@ -590,73 +627,11 @@ mod tests {
         assert!(loaded.is_empty());
     }
 
-    // --- try_link_pairs_jack error on empty ---
-    // Can't test success without JACK, but can test empty-port rejection
+    // --- pw_link error handling ---
 
     #[test]
-    fn try_link_empty_sources_errors() {
-        // Need a JACK client — skip if JACK unavailable
-        let client = jack::Client::new("bn-test", jack::ClientOptions::NO_START_SERVER);
-        let Ok((jc, _)) = client else { return };
-        let result = try_link_pairs_jack(&jc, &[], &["dest:port".into()]);
+    fn pw_link_rejects_empty_args() {
+        let result = pw_link("", "");
         assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("sources: 0"));
     }
-
-    #[test]
-    fn try_link_empty_destinations_errors() {
-        let client = jack::Client::new("bn-test2", jack::ClientOptions::NO_START_SERVER);
-        let Ok((jc, _)) = client else { return };
-        let result = try_link_pairs_jack(&jc, &["src:port".into()], &[]);
-        assert!(result.is_err());
-        let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("destinations: 0"));
-    }
-}
-
-fn has_midi_input(client: &str) -> bool {
-    let probe = jack::Client::new("bn-probe", jack::ClientOptions::NO_START_SERVER);
-    let (jc, _) = match probe {
-        Ok(c) => c,
-        Err(_) => {
-            log::warn!("JACK probe failed for MIDI detection on {client}");
-            return false;
-        }
-    };
-    let prefix = format!("{client}:");
-    let midi_ins = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_INPUT);
-    midi_ins.iter().any(|p| p.starts_with(&prefix))
-}
-
-fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
-    let (jc, _) = jack::Client::new("bn-wire-midi", jack::ClientOptions::NO_START_SERVER)
-        .map_err(|e| Error::Wiring(format!("JACK client for MIDI wiring failed: {e}")))?;
-
-    let router_prefix = format!("{router_client}:");
-    let target_prefix = format!("{target_client}:");
-
-    let all_midi_outs = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_OUTPUT);
-    let all_midi_ins = jc.ports(None, Some("8 bit raw midi"), jack::PortFlags::IS_INPUT);
-
-    let router_port = all_midi_outs
-        .iter()
-        .find(|p| p.starts_with(&router_prefix) && p.contains(target_client));
-    let target_port = all_midi_ins
-        .iter()
-        .find(|p| p.starts_with(&target_prefix));
-
-    if let (Some(out), Some(inp)) = (router_port, target_port) {
-        match jc.connect_ports_by_name(out, inp) {
-            Ok(()) => log::debug!("linked midi: {out} → {inp}"),
-            Err(jack::Error::PortAlreadyConnected(_, _)) => {}
-            Err(e) => {
-                return Err(Error::Wiring(format!(
-                    "midi connect {out} → {inp} failed: {e}"
-                )));
-            }
-        }
-    }
-
-    Ok(())
 }
