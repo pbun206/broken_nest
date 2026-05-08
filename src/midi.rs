@@ -109,6 +109,106 @@ impl jack::ProcessHandler for MidiProcessHandler {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_on_encoding() {
+        let (len, bytes) = MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 }.to_bytes();
+        assert_eq!(len, 3);
+        assert_eq!(bytes, [0x90, 60, 100]);
+    }
+
+    #[test]
+    fn note_on_channel_mask() {
+        let (_, bytes) = MidiEvent::NoteOn { channel: 15, note: 60, velocity: 100 }.to_bytes();
+        assert_eq!(bytes[0], 0x9F);
+    }
+
+    #[test]
+    fn note_on_clamps_to_4_bits() {
+        let (_, bytes) = MidiEvent::NoteOn { channel: 0xFF, note: 60, velocity: 100 }.to_bytes();
+        assert_eq!(bytes[0], 0x9F);
+    }
+
+    #[test]
+    fn note_off_encoding() {
+        let (len, bytes) = MidiEvent::NoteOff { channel: 1, note: 64, velocity: 0 }.to_bytes();
+        assert_eq!(len, 3);
+        assert_eq!(bytes, [0x81, 64, 0]);
+    }
+
+    #[test]
+    fn cc_encoding() {
+        let (len, bytes) = MidiEvent::Cc { channel: 0, controller: 7, value: 127 }.to_bytes();
+        assert_eq!(len, 3);
+        assert_eq!(bytes, [0xB0, 7, 127]);
+    }
+
+    #[test]
+    fn pitch_bend_center() {
+        let (len, bytes) = MidiEvent::PitchBend { channel: 0, value: 0 }.to_bytes();
+        assert_eq!(len, 3);
+        // center = 8192 = 0x2000, lsb = 0x00, msb = 0x40
+        assert_eq!(bytes, [0xE0, 0x00, 0x40]);
+    }
+
+    #[test]
+    fn pitch_bend_max() {
+        let (_, bytes) = MidiEvent::PitchBend { channel: 0, value: 8191 }.to_bytes();
+        assert_eq!(bytes, [0xE0, 0x7F, 0x7F]);
+    }
+
+    #[test]
+    fn pitch_bend_min() {
+        let (_, bytes) = MidiEvent::PitchBend { channel: 0, value: -8192 }.to_bytes();
+        assert_eq!(bytes, [0xE0, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn program_change_encoding() {
+        let (len, bytes) = MidiEvent::ProgramChange { channel: 2, program: 42 }.to_bytes();
+        assert_eq!(len, 2);
+        assert_eq!(bytes[0], 0xC2);
+        assert_eq!(bytes[1], 42);
+    }
+
+    #[test]
+    fn raw_passthrough() {
+        let (len, bytes) = MidiEvent::Raw { len: 2, data: [0xF3, 0x05, 0x00] }.to_bytes();
+        assert_eq!(len, 2);
+        assert_eq!(bytes, [0xF3, 0x05, 0x00]);
+    }
+
+    #[test]
+    fn note_value_clamped_to_7_bits() {
+        let (_, bytes) = MidiEvent::NoteOn { channel: 0, note: 0xFF, velocity: 0xFF }.to_bytes();
+        assert_eq!(bytes[1], 0x7F);
+        assert_eq!(bytes[2], 0x7F);
+    }
+
+    #[test]
+    fn midi_channel_roundtrip() {
+        let (sender, port) = create_midi_channel("test", 16);
+        let event = MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 };
+        sender.send(event).unwrap();
+
+        let mut consumer = port.consumer;
+        let received = consumer.pop().unwrap();
+        assert_eq!(received.to_bytes(), event.to_bytes());
+    }
+
+    #[test]
+    fn midi_channel_full() {
+        let (sender, _port) = create_midi_channel("test", 2);
+        let event = MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 };
+        sender.send(event).unwrap();
+        sender.send(event).unwrap();
+        assert!(sender.send(event).is_err());
+    }
+}
+
 impl MidiRouter {
     /// Create and activate a JACK client with one MIDI output port per
     /// [`MidiPort`]. The client immediately starts processing audio cycles.

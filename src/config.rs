@@ -126,3 +126,85 @@ impl PluginBuilder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chain_builder_defaults() {
+        let config = ChainBuilder::new("test").build();
+        assert_eq!(config.name, "test");
+        assert_eq!(config.jack_client_prefix, "bn");
+        assert_eq!(config.buffer_size, None);
+        assert!(!config.auto_connect_input);
+        assert!(!config.auto_connect_output);
+        assert!(config.plugins.is_empty());
+    }
+
+    #[test]
+    fn chain_builder_all_options() {
+        let plugin = PluginBuilder::new("urn:test", "p1").build();
+        let config = ChainBuilder::new("rig")
+            .jack_client_prefix("myprefix")
+            .buffer_size(256)
+            .auto_connect_input()
+            .auto_connect_output()
+            .plugin(plugin)
+            .build();
+
+        assert_eq!(config.jack_client_prefix, "myprefix");
+        assert_eq!(config.buffer_size, Some(256));
+        assert!(config.auto_connect_input);
+        assert!(config.auto_connect_output);
+        assert_eq!(config.plugins.len(), 1);
+    }
+
+    #[test]
+    fn plugin_builder_defaults() {
+        let plugin = PluginBuilder::new("urn:test", "comp").build();
+        assert_eq!(plugin.uri, "urn:test");
+        assert_eq!(plugin.name, "comp");
+        assert!(plugin.show_ui);
+        assert!(plugin.midi_in.is_none());
+        assert!(plugin.controls.is_empty());
+    }
+
+    #[test]
+    fn plugin_builder_all_options() {
+        let plugin = PluginBuilder::new("urn:synth", "synth1")
+            .hide_ui()
+            .midi_in(true)
+            .control("gain", 0.75)
+            .control("freq", 440.0)
+            .build();
+
+        assert!(!plugin.show_ui);
+        assert_eq!(plugin.midi_in, Some(true));
+        assert_eq!(plugin.controls.len(), 2);
+        assert!((plugin.controls["gain"] - 0.75).abs() < f32::EPSILON);
+        assert!((plugin.controls["freq"] - 440.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn plugin_builder_control_override() {
+        let plugin = PluginBuilder::new("urn:test", "p")
+            .control("gain", 0.5)
+            .control("gain", 0.9)
+            .build();
+        assert!((plugin.controls["gain"] - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn chain_builder_multiple_plugins() {
+        let config = ChainBuilder::new("chain")
+            .plugin(PluginBuilder::new("urn:a", "a").build())
+            .plugin(PluginBuilder::new("urn:b", "b").build())
+            .plugin(PluginBuilder::new("urn:c", "c").build())
+            .build();
+        assert_eq!(config.plugins.len(), 3);
+        assert_eq!(config.plugins[0].name, "a");
+        assert_eq!(config.plugins[1].name, "b");
+        assert_eq!(config.plugins[2].name, "c");
+    }
+}

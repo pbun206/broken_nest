@@ -164,3 +164,63 @@ fn parse_control_line(line: &str) -> Option<(String, f32)> {
     }
     Some((sym, val))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_simple() {
+        let (sym, val) = parse_control_line("gain = 0.5").unwrap();
+        assert_eq!(sym, "gain");
+        assert!((val - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_leading_whitespace() {
+        let (sym, val) = parse_control_line("  gain = 1.0").unwrap();
+        assert_eq!(sym, "gain");
+        assert!((val - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_negative_value() {
+        let (sym, val) = parse_control_line("offset = -3.14").unwrap();
+        assert_eq!(sym, "offset");
+        assert!((val - (-3.14)).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_integer_value() {
+        let (sym, val) = parse_control_line("rate = 44100").unwrap();
+        assert_eq!(sym, "rate");
+        assert!((val - 44100.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn parse_no_equals_returns_none() {
+        assert!(parse_control_line("no equals here").is_none());
+    }
+
+    #[test]
+    fn parse_empty_symbol_returns_none() {
+        assert!(parse_control_line(" = 0.5").is_none());
+    }
+
+    #[test]
+    fn parse_non_numeric_value_returns_none() {
+        assert!(parse_control_line("gain = abc").is_none());
+    }
+
+    #[test]
+    fn parse_empty_line_returns_none() {
+        assert!(parse_control_line("").is_none());
+    }
+
+    #[test]
+    fn parse_extra_spaces() {
+        let (sym, val) = parse_control_line("  volume   =   0.75  ").unwrap();
+        assert_eq!(sym, "volume");
+        assert!((val - 0.75).abs() < f32::EPSILON);
+    }
+}
