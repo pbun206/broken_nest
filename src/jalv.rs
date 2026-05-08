@@ -40,10 +40,7 @@ impl JalvInstance {
     ) -> Result<Self, Error> {
         let mut cmd = Command::new("jalv.gtk3");
 
-        match mode {
-            UiMode::Headless => { cmd.env("GDK_BACKEND", "offscreen"); }
-            UiMode::Gtk => { cmd.env("GDK_BACKEND", "x11"); }
-        };
+        cmd.env("GDK_BACKEND", "x11");
         cmd.arg("-n").arg(&plugin.name);
         cmd.arg("--print-controls");
 
