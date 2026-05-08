@@ -140,28 +140,18 @@ impl Chain {
         Ok(self.midi_senders.values_mut().next().unwrap())
     }
 
-    /// Show the plugin UI window. Respawns with X11 GDK backend if currently headless.
-    /// Brief audio gap (~1s) during respawn.
+    /// Show the plugin UI window (xdotool windowmap). No respawn, no audio gap.
     pub fn show_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
         let idx = self.find_plugin_idx(plugin_name)?;
-
-        if self.instances[idx].ui_mode() == UiMode::Gtk && self.instances[idx].is_running() {
-            return Ok(());
-        }
-
-        self.respawn_plugin(idx, UiMode::Gtk)
+        self.instances[idx].map_window();
+        Ok(())
     }
 
-    /// Hide the plugin UI window. Respawns with offscreen GDK backend.
-    /// Brief audio gap (~1s) during respawn.
+    /// Hide the plugin UI window (xdotool windowunmap). No respawn, no audio gap.
     pub fn hide_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
         let idx = self.find_plugin_idx(plugin_name)?;
-
-        if self.instances[idx].ui_mode() == UiMode::Headless && self.instances[idx].is_running() {
-            return Ok(());
-        }
-
-        self.respawn_plugin(idx, UiMode::Headless)
+        self.instances[idx].unmap_window();
+        Ok(())
     }
 
     /// Show UI windows for all plugins.
