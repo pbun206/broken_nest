@@ -60,53 +60,20 @@ impl MidiSender {
     }
 }
 
-/// Consumer side of a single plugin's MIDI channel, paired with the JACK
-/// output port name it will be registered under.
+/// Consumer side of a single plugin's MIDI channel.
 pub(crate) struct MidiPort {
-    pub name: String,
     pub consumer: Consumer<MidiEvent>,
 }
 
 /// Create a lock-free MIDI channel: a [`MidiSender`] for the caller and a
-/// [`MidiPort`] that the [`MidiRouter`] will drain in the JACK process callback.
-pub(crate) fn create_midi_channel(name: &str, capacity: usize) -> (MidiSender, MidiPort) {
+/// [`MidiPort`] whose consumer is drained in the chain's JACK process callback.
+pub(crate) fn create_midi_channel(capacity: usize) -> (MidiSender, MidiPort) {
     let (producer, consumer) = RingBuffer::new(capacity);
     let sender = MidiSender {
         producer: Arc::new(Mutex::new(producer)),
     };
-    let port = MidiPort {
-        name: name.to_string(),
-        consumer,
-    };
+    let port = MidiPort { consumer };
     (sender, port)
-}
-
-/// JACK client that owns one MIDI output port per plugin and drains the
-/// corresponding ring buffers in the real-time process callback.
-pub(crate) struct MidiRouter {
-    _client: jack::AsyncClient<(), MidiProcessHandler>,
-}
-
-/// Real-time JACK process handler. Each cycle, drains every ring buffer and
-/// writes the encoded MIDI bytes to the corresponding JACK MIDI output port.
-pub(crate) struct MidiProcessHandler {
-    ports: Vec<(jack::Port<jack::MidiOut>, Consumer<MidiEvent>)>,
-}
-
-impl jack::ProcessHandler for MidiProcessHandler {
-    fn process(&mut self, _client: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
-        for (port, consumer) in &mut self.ports {
-            let mut writer = port.writer(ps);
-            while let Ok(event) = consumer.pop() {
-                let (len, bytes) = event.to_bytes();
-                let _ = writer.write(&jack::RawMidi {
-                    time: 0,
-                    bytes: &bytes[..len],
-                });
-            }
-        }
-        jack::Control::Continue
-    }
 }
 
 #[cfg(test)]
@@ -190,7 +157,7 @@ mod tests {
 
     #[test]
     fn midi_channel_roundtrip() {
-        let (sender, port) = create_midi_channel("test", 16);
+        let (sender, port) = create_midi_channel(16);
         let event = MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 };
         sender.send(event).unwrap();
 
@@ -201,7 +168,7 @@ mod tests {
 
     #[test]
     fn midi_channel_full() {
-        let (sender, _port) = create_midi_channel("test", 2);
+        let (sender, _port) = create_midi_channel(2);
         let event = MidiEvent::NoteOn { channel: 0, note: 60, velocity: 100 };
         sender.send(event).unwrap();
         sender.send(event).unwrap();
@@ -209,39 +176,3 @@ mod tests {
     }
 }
 
-impl MidiRouter {
-    /// Create and activate a JACK client with one MIDI output port per
-    /// [`MidiPort`]. The client immediately starts processing audio cycles.
-    pub fn new(
-        client_name: &str,
-        ports: Vec<MidiPort>,
-    ) -> Result<Self, crate::error::Error> {
-        let (client, _status) = jack::Client::new(
-            client_name,
-            jack::ClientOptions::NO_START_SERVER,
-        )
-        .map_err(|e| crate::error::Error::Wiring(format!("JACK client failed: {e}")))?;
-
-        let mut jack_ports = Vec::with_capacity(ports.len());
-        for midi_port in ports {
-            let port = client
-                .register_port(&midi_port.name, jack::MidiOut::default())
-                .map_err(|e| {
-                    crate::error::Error::Wiring(format!(
-                        "failed to register MIDI port '{}': {e}",
-                        midi_port.name
-                    ))
-                })?;
-            jack_ports.push((port, midi_port.consumer));
-        }
-
-        let handler = MidiProcessHandler { ports: jack_ports };
-        let active = client.activate_async((), handler).map_err(|e| {
-            crate::error::Error::Wiring(format!("JACK activate failed: {e}"))
-        })?;
-
-        Ok(Self {
-            _client: active,
-        })
-    }
-}

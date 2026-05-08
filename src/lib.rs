@@ -1,8 +1,7 @@
-//! **broken_nest** — LV2 plugin chain host built on top of
-//! [jalv](https://gitlab.com/drobilla/jalv).
+//! **broken_nest** — LV2 plugin chain host using lilv + JACK.
 //!
-//! Spawns one `jalv` process per plugin, wires their audio ports together via
-//! `pw-link`, and optionally routes MIDI to plugins that expose MIDI inputs.
+//! Hosts LV2 plugins in-process via lilv, routes audio through a single JACK
+//! client, and optionally routes MIDI to plugins that expose MIDI inputs.
 //!
 //! # Quick start
 //!
@@ -41,7 +40,9 @@ pub mod chain;
 pub mod config;
 pub mod error;
 pub mod midi;
-mod jalv;
+mod features;
+mod plugin;
+mod ui;
 
 pub use chain::Chain;
 pub use config::{ChainBuilder, ChainConfig, PluginBuilder, PluginConfig};

@@ -2,105 +2,392 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::thread;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::config::ChainConfig;
 use crate::error::Error;
-use crate::jalv::{JalvInstance, UiMode};
-use crate::midi::{self, MidiRouter, MidiSender};
+use crate::features::FeatureSet;
+use crate::midi::{self, MidiEvent, MidiSender};
+use crate::plugin::Lv2PluginInstance;
+use crate::ui;
 
 const MIDI_RING_CAPACITY: usize = 1024;
 
+// ─── ControlBridge ──────────────────────────────────────────────────
+
+struct PluginControlBridge {
+    name: String,
+    symbol_to_idx: HashMap<String, usize>,
+    symbols: Vec<String>,
+    values: Vec<AtomicU32>,
+}
+
+pub(crate) struct ControlBridge {
+    plugins: Vec<PluginControlBridge>,
+}
+
+impl ControlBridge {
+    fn new(plugins: &[Lv2PluginInstance]) -> Self {
+        let bridge_plugins = plugins
+            .iter()
+            .map(|plugin| {
+                let symbols = plugin.control_port_symbols();
+                let controls = plugin.current_controls();
+                let values: Vec<AtomicU32> = symbols
+                    .iter()
+                    .map(|sym| {
+                        let val = controls.get(sym).copied().unwrap_or(0.0);
+                        AtomicU32::new(val.to_bits())
+                    })
+                    .collect();
+                let symbol_to_idx: HashMap<String, usize> = symbols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (s.clone(), i))
+                    .collect();
+                PluginControlBridge {
+                    name: plugin.name.clone(),
+                    symbol_to_idx,
+                    symbols,
+                    values,
+                }
+            })
+            .collect();
+        Self {
+            plugins: bridge_plugins,
+        }
+    }
+
+    fn set_control(&self, plugin_name: &str, port: &str, value: f32) -> Result<(), Error> {
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.name == plugin_name)
+            .ok_or_else(|| Error::PluginNotFound {
+                name: plugin_name.into(),
+            })?;
+        let idx = plugin.symbol_to_idx.get(port).ok_or_else(|| {
+            Error::ControlPortNotFound {
+                name: plugin_name.into(),
+                port: port.into(),
+            }
+        })?;
+        plugin.values[*idx].store(value.to_bits(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn all_controls(&self) -> HashMap<String, HashMap<String, f32>> {
+        self.plugins
+            .iter()
+            .map(|p| {
+                let controls: HashMap<String, f32> = p
+                    .symbols
+                    .iter()
+                    .enumerate()
+                    .map(|(i, sym)| {
+                        (sym.clone(), f32::from_bits(p.values[i].load(Ordering::Relaxed)))
+                    })
+                    .collect();
+                (p.name.clone(), controls)
+            })
+            .collect()
+    }
+
+    pub(crate) fn set_control_by_bridge_index(&self, plugin_name: &str, idx: usize, value: f32) {
+        if let Some(atomic) = self
+            .plugins
+            .iter()
+            .find(|p| p.name == plugin_name)
+            .and_then(|p| p.values.get(idx))
+        {
+            atomic.store(value.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    fn sync_to_plugins(&self, plugins: &mut [Lv2PluginInstance]) {
+        for (bridge, plugin) in self.plugins.iter().zip(plugins.iter_mut()) {
+            for (i, _) in bridge.values.iter().enumerate() {
+                let value = f32::from_bits(bridge.values[i].load(Ordering::Relaxed));
+                plugin.set_control_by_index(i, value);
+            }
+        }
+    }
+}
+
+// ─── ChainProcessHandler ───────────────────────────────────────────
+
+struct ChainProcessHandler {
+    plugins: Vec<Lv2PluginInstance>,
+    jack_audio_inputs: Vec<jack::Port<jack::AudioIn>>,
+    jack_audio_outputs: Vec<jack::Port<jack::AudioOut>>,
+    midi_consumers: Vec<(usize, rtrb::Consumer<MidiEvent>)>,
+    control_bridge: Arc<ControlBridge>,
+}
+
+impl jack::ProcessHandler for ChainProcessHandler {
+    fn process(&mut self, _client: &jack::Client, ps: &jack::ProcessScope) -> jack::Control {
+        let nframes = ps.n_frames() as usize;
+
+        // Sync control atomics → plugin values
+        self.control_bridge.sync_to_plugins(&mut self.plugins);
+
+        // Clear atom buffers
+        for plugin in &mut self.plugins {
+            plugin.clear_atom_buffers();
+        }
+
+        // Drain MIDI ring buffers → atom inputs
+        for (plugin_idx, consumer) in &mut self.midi_consumers {
+            let mut events: Vec<(usize, [u8; 3])> = Vec::new();
+            while let Ok(event) = consumer.pop() {
+                events.push(event.to_bytes());
+            }
+            if !events.is_empty() {
+                let refs: Vec<(i64, &[u8])> = events
+                    .iter()
+                    .map(|(len, data)| (0i64, &data[..*len]))
+                    .collect();
+                self.plugins[*plugin_idx].write_midi_to_atom_in(&refs);
+            }
+        }
+
+        // Copy JACK audio input → first plugin
+        if let Some(first) = self.plugins.first_mut() {
+            let in_bufs = first.audio_in_bufs_mut();
+            for (i, jack_port) in self.jack_audio_inputs.iter().enumerate() {
+                if let Some(buf) = in_bufs.get_mut(i) {
+                    buf[..nframes].copy_from_slice(&jack_port.as_slice(ps)[..nframes]);
+                }
+            }
+        }
+
+        // Run plugins in series, copy audio between adjacent plugins
+        for i in 0..self.plugins.len() {
+            self.plugins[i].run(nframes as u32);
+
+            if i + 1 < self.plugins.len() {
+                let (left, right) = self.plugins.split_at_mut(i + 1);
+                let src = left[i].audio_out_bufs();
+                let dst = right[0].audio_in_bufs_mut();
+                let pairs = src.len().min(dst.len());
+                for j in 0..pairs {
+                    dst[j][..nframes].copy_from_slice(&src[j][..nframes]);
+                }
+            }
+        }
+
+        // Copy last plugin audio output → JACK output
+        if let Some(last) = self.plugins.last() {
+            let out_bufs = last.audio_out_bufs();
+            for (i, jack_port) in self.jack_audio_outputs.iter_mut().enumerate() {
+                let jack_buf = jack_port.as_mut_slice(ps);
+                if let Some(buf) = out_bufs.get(i) {
+                    jack_buf[..nframes].copy_from_slice(&buf[..nframes]);
+                } else {
+                    jack_buf[..nframes].fill(0.0);
+                }
+            }
+        }
+
+        jack::Control::Continue
+    }
+}
+
+// ─── Chain ──────────────────────────────────────────────────────────
+
 /// A running chain of LV2 plugins wired in series.
 ///
-/// Each plugin runs as a separate `jalv` process. Audio ports are connected
-/// left-to-right via the JACK API. If any plugin exposes MIDI input, a dedicated
-/// JACK client is created to route [`MidiEvent`](crate::MidiEvent)s from
-/// user code into the corresponding plugin.
+/// All plugins run in-process within a single JACK client. Audio is
+/// routed through memory buffers, so no external wiring is needed.
 ///
-/// Drop or call [`Chain::stop`] to tear down all child processes and JACK
-/// connections.
+/// Drop or call [`Chain::stop`] to tear down the JACK client.
 pub struct Chain {
     config: ChainConfig,
-    instances: Vec<JalvInstance>,
-    midi_router: Option<MidiRouter>,
+    active_client: Option<jack::AsyncClient<(), ChainProcessHandler>>,
+    control_bridge: Arc<ControlBridge>,
     midi_senders: HashMap<String, MidiSender>,
+    jack_input_port_names: Vec<String>,
+    jack_output_port_names: Vec<String>,
+    ui_infos: HashMap<String, ui::PluginUiInfo>,
+    #[cfg(feature = "ui")]
+    ui_thread: Option<ui::UiThread>,
+    _features: Box<FeatureSet>,
+    _world: lilv::World,
 }
 
 impl Chain {
-    /// Spawn all plugins, wire audio ports in series, and set up MIDI routing.
+    /// Instantiate all plugins, create a single JACK client, and start processing.
     ///
-    /// Plugins start headless (no GUI window) by default. Call [`show_ui`] or
-    /// [`show_all_ui`] to open plugin windows.
-    ///
-    /// If `ChainConfig::state_dir` is set, saved control values are restored
-    /// automatically.
+    /// If saved state exists, control values are restored automatically.
     pub fn start(config: &ChainConfig) -> Result<Self, Error> {
         if config.plugins.is_empty() {
             return Err(Error::Config("chain has no plugins".into()));
         }
 
+        // JACK client
+        let (client, _status) = jack::Client::new(
+            &config.jack_client_prefix,
+            jack::ClientOptions::NO_START_SERVER,
+        )
+        .map_err(|e| Error::Jack(format!("failed to create JACK client: {e}")))?;
+
+        let sample_rate = client.sample_rate() as f64;
+        let buffer_size = config.buffer_size.unwrap_or(client.buffer_size());
+
+        // LV2 world + features
+        let world = lilv::World::with_load_all();
+        let features = Box::new(FeatureSet::new(sample_rate, buffer_size));
+
         let state_dir = state_dir_for(&config.name);
-        let mut instances = Vec::with_capacity(config.plugins.len());
 
-        for plugin in &config.plugins {
-            let saved = load_controls(&state_dir, &plugin.name);
-            let mode = if plugin.show_ui { UiMode::Gtk } else { UiMode::Headless };
-            let instance = JalvInstance::spawn(plugin, config.buffer_size, mode, &saved)?;
-            instances.push(instance);
+        // Instantiate plugins
+        let mut plugins = Vec::with_capacity(config.plugins.len());
+        for plugin_cfg in &config.plugins {
+            let mut inst = Lv2PluginInstance::new(
+                &world,
+                &plugin_cfg.uri,
+                &plugin_cfg.name,
+                sample_rate,
+                buffer_size,
+                &features,
+            )
+            .map_err(|e| {
+                log::error!("failed to instantiate '{}': {e}", plugin_cfg.name);
+                e
+            })?;
+
+            // Apply saved state
+            let saved = load_controls(&state_dir, &plugin_cfg.name);
+            for (sym, val) in &saved {
+                let _ = inst.set_control(sym, *val);
+            }
+
+            // Apply config overrides (take precedence over saved state)
+            for (sym, val) in &plugin_cfg.controls {
+                let _ = inst.set_control(sym, *val);
+            }
+
+            plugins.push(inst);
         }
 
-        // Wire adjacent plugins (audio)
-        for i in 0..instances.len() - 1 {
-            let from = instances[i].jack_client_name().to_string();
-            let to = instances[i + 1].jack_client_name().to_string();
-            wire_plugins(&from, &to)?;
-        }
-
-        if config.auto_connect_input || config.auto_connect_output {
-            auto_connect(&instances, config)?;
-        }
-
-        // MIDI routing
+        // MIDI setup
         let mut midi_senders = HashMap::new();
-        let mut midi_ports = Vec::new();
+        let mut midi_consumers = Vec::new();
 
-        for (instance, plugin_cfg) in instances.iter().zip(&config.plugins) {
-            let name = instance.jack_client_name();
-            let wants_midi = plugin_cfg
-                .midi_in
-                .unwrap_or_else(|| has_midi_input(name));
+        for (i, (inst, plugin_cfg)) in plugins.iter().zip(&config.plugins).enumerate() {
+            let wants_midi = plugin_cfg.midi_in.unwrap_or_else(|| inst.has_midi_in());
             if wants_midi {
-                let (sender, port) = midi::create_midi_channel(name, MIDI_RING_CAPACITY);
-                midi_senders.insert(name.to_string(), sender);
-                midi_ports.push(port);
+                let (sender, port) = midi::create_midi_channel(MIDI_RING_CAPACITY);
+                midi_senders.insert(inst.name.clone(), sender);
+                midi_consumers.push((i, port.consumer));
             }
         }
 
-        let midi_router = if !midi_ports.is_empty() {
-            let router_name = format!("{}-midi", config.jack_client_prefix);
-            let router = MidiRouter::new(&router_name, midi_ports)?;
+        // Discover UIs
+        let mut ui_infos = HashMap::new();
+        for (inst, plugin_cfg) in plugins.iter().zip(&config.plugins) {
+            let port_pairs = inst.all_port_symbol_index_pairs();
+            let ctrl_indices = inst.control_in_port_indices();
+            if let Some(info) = ui::discover_ui(
+                &world,
+                &plugin_cfg.uri,
+                &inst.name,
+                &port_pairs,
+                &ctrl_indices,
+            ) {
+                log::debug!("found UI for '{}'", inst.name);
+                ui_infos.insert(inst.name.clone(), info);
+            }
+        }
 
-            thread::sleep(Duration::from_millis(200));
-            for instance in &instances {
-                let name = instance.jack_client_name();
-                if midi_senders.contains_key(name) {
-                    wire_midi(&format!("{}-midi", config.jack_client_prefix), name)?;
+        // Control bridge
+        let control_bridge = Arc::new(ControlBridge::new(&plugins));
+
+        // Register JACK audio ports
+        let first_in_count = plugins.first().map_or(0, |p| p.audio_in_count());
+        let last_out_count = plugins.last().map_or(0, |p| p.audio_out_count());
+
+        let mut jack_audio_inputs = Vec::with_capacity(first_in_count);
+        let mut jack_input_port_names = Vec::with_capacity(first_in_count);
+        for i in 0..first_in_count {
+            let name = format!("audio_in_{}", i + 1);
+            let port = client
+                .register_port(&name, jack::AudioIn::default())
+                .map_err(|e| Error::Jack(format!("register input port: {e}")))?;
+            let full_name = format!("{}:{name}", client.name());
+            jack_input_port_names.push(full_name);
+            jack_audio_inputs.push(port);
+        }
+
+        let mut jack_audio_outputs = Vec::with_capacity(last_out_count);
+        let mut jack_output_port_names = Vec::with_capacity(last_out_count);
+        for i in 0..last_out_count {
+            let name = format!("audio_out_{}", i + 1);
+            let port = client
+                .register_port(&name, jack::AudioOut::default())
+                .map_err(|e| Error::Jack(format!("register output port: {e}")))?;
+            let full_name = format!("{}:{name}", client.name());
+            jack_output_port_names.push(full_name);
+            jack_audio_outputs.push(port);
+        }
+
+        // Activate
+        let handler = ChainProcessHandler {
+            plugins,
+            jack_audio_inputs,
+            jack_audio_outputs,
+            midi_consumers,
+            control_bridge: control_bridge.clone(),
+        };
+
+        let active_client = client.activate_async((), handler).map_err(|e| {
+            Error::Jack(format!("JACK activate failed: {e}"))
+        })?;
+
+        // Auto-connect
+        if config.auto_connect_input {
+            let physical = active_client.as_client().ports(
+                None,
+                None,
+                jack::PortFlags::IS_PHYSICAL | jack::PortFlags::IS_OUTPUT,
+            );
+            for (src, dst) in physical.iter().zip(jack_input_port_names.iter()) {
+                if let Err(e) = active_client.as_client().connect_ports_by_name(src, dst) {
+                    log::warn!("auto-connect input {src} → {dst}: {e}");
+                } else {
+                    log::debug!("connected {src} → {dst}");
                 }
             }
+        }
 
-            Some(router)
-        } else {
-            None
-        };
+        if config.auto_connect_output {
+            let physical = active_client.as_client().ports(
+                None,
+                None,
+                jack::PortFlags::IS_PHYSICAL | jack::PortFlags::IS_INPUT,
+            );
+            for (src, dst) in jack_output_port_names.iter().zip(physical.iter()) {
+                if let Err(e) = active_client.as_client().connect_ports_by_name(src, dst) {
+                    log::warn!("auto-connect output {src} → {dst}: {e}");
+                } else {
+                    log::debug!("connected {src} → {dst}");
+                }
+            }
+        }
 
         Ok(Self {
             config: config.clone(),
-            instances,
-            midi_router,
+            active_client: Some(active_client),
+            control_bridge,
             midi_senders,
+            jack_input_port_names,
+            jack_output_port_names,
+            ui_infos,
+            #[cfg(feature = "ui")]
+            ui_thread: None,
+            _features: features,
+            _world: world,
         })
     }
 
@@ -111,14 +398,7 @@ impl Chain {
         port: &str,
         value: f32,
     ) -> Result<(), Error> {
-        let instance = self
-            .instances
-            .iter_mut()
-            .find(|i| i.jack_client_name() == plugin_name)
-            .ok_or_else(|| Error::PluginNotFound {
-                name: plugin_name.into(),
-            })?;
-        instance.set_control(port, value)
+        self.control_bridge.set_control(plugin_name, port, value)
     }
 
     /// Get a [`MidiSender`] for pushing MIDI events to the named plugin.
@@ -140,148 +420,98 @@ impl Chain {
         Ok(self.midi_senders.values_mut().next().unwrap())
     }
 
-    /// Show the plugin UI window. Respawns without xvfb-run if currently headless.
-    /// Brief audio gap (~1s) during respawn.
-    pub fn show_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
-        let idx = self.find_plugin_idx(plugin_name)?;
+    /// Show the plugin UI window (requires `ui` feature, no-op without it).
+    pub fn show_ui(&mut self, _plugin_name: &str) -> Result<(), Error> {
+        #[cfg(feature = "ui")]
+        {
+            let info = self
+                .ui_infos
+                .remove(_plugin_name)
+                .ok_or_else(|| Error::PluginNotFound {
+                    name: _plugin_name.into(),
+                })?;
 
-        if self.instances[idx].ui_mode() == UiMode::Gtk && self.instances[idx].is_running() {
-            return Ok(());
+            let ui_thread = self.ui_thread.get_or_insert_with(ui::UiThread::start);
+            let features_ptr = self._features.as_feature_ptrs();
+            ui_thread.show(info, self.control_bridge.clone(), features_ptr);
         }
-
-        self.respawn_plugin(idx, UiMode::Gtk)
+        Ok(())
     }
 
-    /// Hide the plugin UI window. Respawns under xvfb-run.
-    /// Brief audio gap (~1s) during respawn.
-    pub fn hide_ui(&mut self, plugin_name: &str) -> Result<(), Error> {
-        let idx = self.find_plugin_idx(plugin_name)?;
-
-        if self.instances[idx].ui_mode() == UiMode::Headless && self.instances[idx].is_running() {
-            return Ok(());
+    /// Hide the plugin UI window (requires `ui` feature, no-op without it).
+    pub fn hide_ui(&mut self, _plugin_name: &str) -> Result<(), Error> {
+        #[cfg(feature = "ui")]
+        if let Some(ui_thread) = &self.ui_thread {
+            ui_thread.hide(_plugin_name);
         }
-
-        self.respawn_plugin(idx, UiMode::Headless)
+        Ok(())
     }
 
-    /// Show UI windows for all plugins.
+    /// Show UI windows for all plugins that have UIs.
     pub fn show_all_ui(&mut self) -> Result<(), Error> {
-        let names: Vec<String> = self.instances.iter().map(|i| i.name.clone()).collect();
-        for name in names {
-            self.show_ui(&name)?;
+        #[cfg(feature = "ui")]
+        {
+            let names: Vec<String> = self.ui_infos.keys().cloned().collect();
+            for name in names {
+                self.show_ui(&name)?;
+            }
         }
         Ok(())
     }
 
     /// Hide UI windows for all plugins.
     pub fn hide_all_ui(&mut self) -> Result<(), Error> {
-        let names: Vec<String> = self.instances.iter().map(|i| i.name.clone()).collect();
-        for name in names {
-            self.hide_ui(&name)?;
+        #[cfg(feature = "ui")]
+        {
+            let names: Vec<String> = self
+                .config
+                .plugins
+                .iter()
+                .map(|p| p.name.clone())
+                .collect();
+            for name in names {
+                self.hide_ui(&name)?;
+            }
         }
         Ok(())
     }
 
-    /// Check all plugins and auto-respawn any that died (headless).
-    pub fn check_health(&mut self) {
-        for idx in 0..self.instances.len() {
-            if !self.instances[idx].is_running() {
-                log::warn!("plugin '{}' died, respawning headless", self.instances[idx].name);
-                if let Err(e) = self.respawn_plugin(idx, UiMode::Headless) {
-                    log::error!("failed to respawn '{}': {e}", self.config.plugins[idx].name);
-                }
-            }
-        }
-    }
+    /// In-process plugins cannot die independently. This is a no-op.
+    pub fn check_health(&mut self) {}
 
-    /// Tear down the chain: save state, drop MIDI resources, kill all jalv processes.
+    /// Tear down the chain: save state, drop JACK client and plugins.
     pub fn stop(&mut self) {
         self.save_all_state();
         self.midi_senders.clear();
-        drop(self.midi_router.take());
-        for instance in &mut self.instances {
-            instance.kill();
-        }
-        self.instances.clear();
+        drop(self.active_client.take());
     }
 
-    /// Returns `true` if every plugin in the chain is still alive.
+    /// Returns `true` if the JACK client is still active.
     pub fn is_running(&mut self) -> bool {
-        self.instances.iter_mut().all(|i| i.is_running())
+        self.active_client.is_some()
     }
 
-    /// Port names for the first plugin's audio inputs.
+    /// Port names for the chain's JACK audio inputs.
     pub fn chain_input_ports(&self) -> Option<Vec<String>> {
-        let name = self.instances.first()?.jack_client_name();
-        let ports = get_ports(name, PortDirection::Input).ok()?;
-        let audio: Vec<_> = ports.into_iter().filter(|p| is_audio_port(p)).collect();
-        if audio.is_empty() { None } else { Some(audio) }
+        if self.jack_input_port_names.is_empty() {
+            None
+        } else {
+            Some(self.jack_input_port_names.clone())
+        }
     }
 
-    /// Port names for the last plugin's audio outputs.
+    /// Port names for the chain's JACK audio outputs.
     pub fn chain_output_ports(&self) -> Option<Vec<String>> {
-        let name = self.instances.last()?.jack_client_name();
-        let ports = get_ports(name, PortDirection::Output).ok()?;
-        let audio: Vec<_> = ports.into_iter().filter(|p| is_audio_port(p)).collect();
-        if audio.is_empty() { None } else { Some(audio) }
+        if self.jack_output_port_names.is_empty() {
+            None
+        } else {
+            Some(self.jack_output_port_names.clone())
+        }
     }
 
     /// Snapshot of control values for all plugins.
     pub fn all_controls(&self) -> HashMap<String, HashMap<String, f32>> {
-        self.instances
-            .iter()
-            .map(|i| (i.name.clone(), i.current_controls()))
-            .collect()
-    }
-
-    fn find_plugin_idx(&self, name: &str) -> Result<usize, Error> {
-        self.instances
-            .iter()
-            .position(|i| i.jack_client_name() == name)
-            .ok_or_else(|| Error::PluginNotFound { name: name.into() })
-    }
-
-    fn respawn_plugin(&mut self, idx: usize, mode: UiMode) -> Result<(), Error> {
-        let controls = self.instances[idx].current_controls();
-        self.instances[idx].kill();
-
-        let plugin = &self.config.plugins[idx];
-        let instance = JalvInstance::spawn(plugin, self.config.buffer_size, mode, &controls)?;
-        self.instances[idx] = instance;
-
-        // Rewire audio: previous plugin → this → next plugin
-        if idx > 0 {
-            let from = self.instances[idx - 1].jack_client_name().to_string();
-            let to = self.instances[idx].jack_client_name().to_string();
-            wire_plugins(&from, &to)?;
-        }
-        if idx + 1 < self.instances.len() {
-            let from = self.instances[idx].jack_client_name().to_string();
-            let to = self.instances[idx + 1].jack_client_name().to_string();
-            wire_plugins(&from, &to)?;
-        }
-
-        // Rewire auto-connect if this is first/last
-        if idx == 0 && self.config.auto_connect_input {
-            auto_connect_chain(
-                self.instances[0].jack_client_name(),
-                PortDirection::Input,
-            )?;
-        }
-        if idx == self.instances.len() - 1 && self.config.auto_connect_output {
-            auto_connect_chain(
-                self.instances.last().unwrap().jack_client_name(),
-                PortDirection::Output,
-            )?;
-        }
-
-        // Rewire MIDI if applicable
-        let name = self.instances[idx].jack_client_name().to_string();
-        if self.midi_senders.contains_key(&name) {
-            wire_midi(&format!("{}-midi", self.config.jack_client_prefix), &name)?;
-        }
-
-        Ok(())
+        self.control_bridge.all_controls()
     }
 
     fn save_all_state(&self) {
@@ -292,16 +522,16 @@ impl Chain {
             return;
         }
 
-        for instance in &self.instances {
-            let controls = instance.current_controls();
+        let all = self.control_bridge.all_controls();
+        for (name, controls) in &all {
             if controls.is_empty() {
                 continue;
             }
-            let path = state_dir.join(format!("{}.toml", instance.name));
-            if let Err(e) = save_controls_file(&path, &controls) {
-                log::error!("failed to save state for '{}': {e}", instance.name);
+            let path = state_dir.join(format!("{name}.toml"));
+            if let Err(e) = save_controls_file(&path, controls) {
+                log::error!("failed to save state for '{name}': {e}");
             } else {
-                log::debug!("saved state for '{}' ({} controls)", instance.name, controls.len());
+                log::debug!("saved state for '{name}' ({} controls)", controls.len());
             }
         }
     }
@@ -313,7 +543,7 @@ impl Drop for Chain {
     }
 }
 
-// --- State I/O ---
+// ─── State I/O ──────────────────────────────────────────────────────
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ControlState {
@@ -365,235 +595,16 @@ fn load_controls(state_dir: &Path, plugin_name: &str) -> HashMap<String, f32> {
     }
 }
 
-// --- Auto-connect (pw-link) ---
-
-fn auto_connect(instances: &[JalvInstance], config: &ChainConfig) -> Result<(), Error> {
-    if config.auto_connect_input {
-        if let Some(first) = instances.first() {
-            auto_connect_chain(first.jack_client_name(), PortDirection::Input)?;
-        }
-    }
-
-    if config.auto_connect_output {
-        if let Some(last) = instances.last() {
-            auto_connect_chain(last.jack_client_name(), PortDirection::Output)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn auto_connect_chain(chain_client: &str, direction: PortDirection) -> Result<(), Error> {
-    log::debug!("auto-connect {chain_client} direction={direction:?}");
-
-    match direction {
-        PortDirection::Input => {
-            let capture_ports = get_physical_ports(PortDirection::Output)?;
-            log::debug!("physical capture ports: {capture_ports:?}");
-            let chain_ins = get_ports(chain_client, PortDirection::Input)?;
-            let audio_ins: Vec<_> = chain_ins.into_iter().filter(|p| is_audio_port(p)).collect();
-            log::debug!("chain audio input ports: {audio_ins:?}");
-            for (src, dst) in capture_ports.iter().zip(audio_ins.iter()) {
-                pw_link(src, dst)?;
-            }
-            Ok(())
-        }
-        PortDirection::Output => {
-            let playback_ports = get_physical_ports(PortDirection::Input)?;
-            log::debug!("physical playback ports: {playback_ports:?}");
-            let chain_outs = get_ports(chain_client, PortDirection::Output)?;
-            let audio_outs: Vec<_> = chain_outs.into_iter().filter(|p| is_audio_port(p)).collect();
-            log::debug!("chain audio output ports: {audio_outs:?}");
-            for (src, dst) in audio_outs.iter().zip(playback_ports.iter()) {
-                pw_link(src, dst)?;
-            }
-            Ok(())
-        }
-    }
-}
-
-// --- Port wiring (pw-link) ---
-
-const PORT_POLL_ATTEMPTS: u32 = 15;
-const PORT_POLL_INTERVAL_MS: u64 = 200;
-
-fn get_ports(client: &str, direction: PortDirection) -> Result<Vec<String>, Error> {
-    let flag = match direction {
-        PortDirection::Output => "-o",
-        PortDirection::Input => "-i",
-    };
-
-    for attempt in 0..PORT_POLL_ATTEMPTS {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(PORT_POLL_INTERVAL_MS));
-        }
-
-        let output = Command::new("pw-link")
-            .arg(flag)
-            .output()
-            .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let ports: Vec<String> = stdout
-            .lines()
-            .map(|l| l.trim().to_string())
-            .filter(|l| l.starts_with(client))
-            .collect();
-
-        if !ports.is_empty() {
-            log::debug!("get_ports({client}, {direction:?}): found {ports:?}");
-            return Ok(ports);
-        }
-
-        log::debug!(
-            "get_ports({client}, {direction:?}): attempt {}/{PORT_POLL_ATTEMPTS} — no ports yet",
-            attempt + 1,
-        );
-    }
-
-    Err(Error::Wiring(format!(
-        "timeout waiting for ports from {client} (direction={direction:?})"
-    )))
-}
-
-fn get_physical_ports(direction: PortDirection) -> Result<Vec<String>, Error> {
-    let flag = match direction {
-        PortDirection::Output => "-o",
-        PortDirection::Input => "-i",
-    };
-
-    let output = Command::new("pw-link")
-        .arg(flag)
-        .output()
-        .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let ports: Vec<String> = stdout
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-
-    log::debug!("get_physical_ports({direction:?}): {ports:?}");
-    Ok(ports)
-}
-
-fn pw_link(from: &str, to: &str) -> Result<(), Error> {
-    let output = Command::new("pw-link")
-        .arg(from)
-        .arg(to)
-        .output()
-        .map_err(|e| Error::Wiring(format!("failed to run pw-link: {e}")))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = stderr.trim();
-        if msg.contains("already linked") {
-            log::debug!("already linked: {from} → {to}");
-            return Ok(());
-        }
-        return Err(Error::Wiring(format!(
-            "pw-link {from} → {to} failed: {msg}"
-        )));
-    }
-
-    log::debug!("linked: {from} → {to}");
-    Ok(())
-}
-
-fn wire_plugins(from: &str, to: &str) -> Result<(), Error> {
-    log::debug!("wiring plugins: {from} → {to}");
-
-    let out_ports = get_ports(from, PortDirection::Output)?;
-    let in_ports = get_ports(to, PortDirection::Input)?;
-
-    let audio_outs: Vec<_> = out_ports.iter().filter(|p| is_audio_port(p)).collect();
-    let audio_ins: Vec<_> = in_ports.iter().filter(|p| is_audio_port(p)).collect();
-
-    log::debug!("wire_plugins: {} outs × {} ins", audio_outs.len(), audio_ins.len());
-
-    for (src, dst) in audio_outs.iter().zip(audio_ins.iter()) {
-        pw_link(src, dst)?;
-    }
-
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug)]
-enum PortDirection {
-    Output,
-    Input,
-}
-
-fn is_audio_port(port: &str) -> bool {
-    let lower = port.to_lowercase();
-    !lower.contains("midi") && !lower.contains("event") && !lower.contains("control")
-}
-
-fn is_midi_port(port: &str) -> bool {
-    let lower = port.to_lowercase();
-    lower.contains("midi") || lower.contains("event")
-}
-
-fn has_midi_input(client: &str) -> bool {
-    get_ports(client, PortDirection::Input)
-        .map(|ports| ports.iter().any(|p| is_midi_port(p)))
-        .unwrap_or(false)
-}
-
-fn wire_midi(router_client: &str, target_client: &str) -> Result<(), Error> {
-    let out_ports = get_ports(router_client, PortDirection::Output)?;
-    let in_ports = get_ports(target_client, PortDirection::Input)?;
-
-    let midi_outs: Vec<_> = out_ports.iter().filter(|p| is_midi_port(p)).collect();
-    let midi_ins: Vec<_> = in_ports.iter().filter(|p| is_midi_port(p)).collect();
-
-    let router_port = midi_outs
-        .iter()
-        .find(|p| p.contains(target_client))
-        .or(midi_outs.first());
-    let target_port = midi_ins.first();
-
-    if let (Some(out), Some(inp)) = (router_port, target_port) {
-        pw_link(out, inp)?;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-
-    // --- is_audio_port / is_midi_port ---
-
-    #[test]
-    fn audio_port_detection() {
-        assert!(is_audio_port("synth:audio_out_1"));
-        assert!(is_audio_port("comp:out_l"));
-        assert!(!is_audio_port("synth:midi_in"));
-        assert!(!is_audio_port("synth:event-in"));
-        assert!(!is_audio_port("synth:control_port"));
-    }
-
-    #[test]
-    fn midi_port_detection() {
-        assert!(is_midi_port("synth:midi_in"));
-        assert!(is_midi_port("synth:MIDI_IN"));
-        assert!(is_midi_port("synth:event-in"));
-        assert!(!is_midi_port("synth:audio_out_1"));
-    }
-
-    // --- state_dir_for ---
 
     #[test]
     fn state_dir_ends_with_chain_name() {
         let dir = state_dir_for("mychain");
         assert!(dir.ends_with("broken_nest/mychain"));
     }
-
-    // --- save / load controls round-trip ---
 
     #[test]
     fn controls_save_load_roundtrip() {
@@ -625,13 +636,5 @@ mod tests {
         std::fs::write(&path, "not valid toml {{{{").unwrap();
         let loaded = load_controls(dir.path(), "bad");
         assert!(loaded.is_empty());
-    }
-
-    // --- pw_link error handling ---
-
-    #[test]
-    fn pw_link_rejects_empty_args() {
-        let result = pw_link("", "");
-        assert!(result.is_err());
     }
 }

@@ -1,12 +1,16 @@
 [package]
 name = "broken_nest"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "LV2 plugin chain host via jalv — stateless orchestrator library"
+description = "LV2 plugin chain host — direct lilv/suil/JACK hosting"
 
 [lib]
 name = "broken_nest"
 path = "src/lib.rs"
+
+[features]
+default = ["ui"]
+ui = ["dep:gtk", "dep:glib", "dep:gdk"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -15,6 +19,15 @@ thiserror = "2"
 log = "0.4"
 jack = "0.13"
 rtrb = "0.3"
+lilv = "0.2"
+lv2_raw = "0.2"
+gtk = { version = "0.18", optional = true }
+glib = { version = "0.18", optional = true }
+gdk = { version = "0.18", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3"
+cc = "1"
 
 [dev-dependencies]
 tempfile = "3"
