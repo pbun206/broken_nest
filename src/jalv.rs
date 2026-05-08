@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::cell::Cell;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use crate::config::PluginConfig;
 use crate::error::Error;
@@ -25,22 +23,29 @@ pub struct JalvInstance {
     stdin: std::process::ChildStdin,
     stdout_reader: Option<std::thread::JoinHandle<()>>,
     controls: Arc<Mutex<HashMap<String, f32>>>,
-    ui_mode: Cell<UiMode>,
+    ui_mode: UiMode,
 }
 
 impl JalvInstance {
     /// Spawn a jalv process for the given plugin configuration.
     ///
-    /// `mode` selects between headless (offscreen GDK) and GUI (X11 window).
-    /// `initial_controls` are extra `-c` flags beyond what's in `plugin.controls`
-    /// (used to restore saved state).
+    /// Both modes use `jalv.gtk3` (headless `jalv` doesn't register
+    /// JACK/PipeWire ports). Headless mode wraps with `xvfb-run` so
+    /// the GTK window renders on a virtual display.
     pub fn spawn(
         plugin: &PluginConfig,
         buffer_size: Option<u32>,
         mode: UiMode,
         initial_controls: &HashMap<String, f32>,
     ) -> Result<Self, Error> {
-        let mut cmd = Command::new("jalv.gtk3");
+        let mut cmd = match mode {
+            UiMode::Headless => {
+                let mut c = Command::new("xvfb-run");
+                c.args(["-a", "jalv.gtk3"]);
+                c
+            }
+            UiMode::Gtk => Command::new("jalv.gtk3"),
+        };
 
         cmd.env("GDK_BACKEND", "x11");
         cmd.arg("-n").arg(&plugin.name);
@@ -93,39 +98,13 @@ impl JalvInstance {
             }
         });
 
-        if mode == UiMode::Headless {
-            let pid = child.id();
-            let name = plugin.name.clone();
-            std::thread::spawn(move || {
-                for _ in 0..25 {
-                    let output = Command::new("xdotool")
-                        .args(["search", "--pid", &pid.to_string()])
-                        .output();
-                    if let Ok(output) = output {
-                        let wids = String::from_utf8_lossy(&output.stdout);
-                        for wid in wids.lines().filter(|l| !l.trim().is_empty()) {
-                            let _ = Command::new("xdotool")
-                                .args(["windowunmap", wid.trim()])
-                                .output();
-                            log::debug!("[{name}] unmapped window {}", wid.trim());
-                        }
-                        if wids.lines().any(|l| !l.trim().is_empty()) {
-                            return;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                log::debug!("[{name}] no window found to unmap");
-            });
-        }
-
         Ok(Self {
             name: plugin.name.clone(),
             child,
             stdin,
             stdout_reader: Some(stdout_reader),
             controls,
-            ui_mode: Cell::new(mode),
+            ui_mode: mode,
         })
     }
 
@@ -152,41 +131,7 @@ impl JalvInstance {
     }
 
     pub fn ui_mode(&self) -> UiMode {
-        self.ui_mode.get()
-    }
-
-    pub fn map_window(&self) {
-        let pid = self.child.id();
-        let output = Command::new("xdotool")
-            .args(["search", "--pid", &pid.to_string()])
-            .output();
-        if let Ok(output) = output {
-            for wid in String::from_utf8_lossy(&output.stdout).lines() {
-                let wid = wid.trim();
-                if !wid.is_empty() {
-                    let _ = Command::new("xdotool").args(["windowmap", wid]).output();
-                    log::debug!("[{}] mapped window {wid}", self.name);
-                }
-            }
-        }
-        self.ui_mode.set(UiMode::Gtk);
-    }
-
-    pub fn unmap_window(&self) {
-        let pid = self.child.id();
-        let output = Command::new("xdotool")
-            .args(["search", "--pid", &pid.to_string()])
-            .output();
-        if let Ok(output) = output {
-            for wid in String::from_utf8_lossy(&output.stdout).lines() {
-                let wid = wid.trim();
-                if !wid.is_empty() {
-                    let _ = Command::new("xdotool").args(["windowunmap", wid]).output();
-                    log::debug!("[{}] unmapped window {wid}", self.name);
-                }
-            }
-        }
-        self.ui_mode.set(UiMode::Headless);
+        self.ui_mode
     }
 
     /// Send SIGKILL to the child and wait for it to exit.
