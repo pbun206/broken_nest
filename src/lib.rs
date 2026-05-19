@@ -42,9 +42,17 @@ pub mod error;
 pub mod midi;
 mod features;
 mod plugin;
+mod state;
 mod ui;
 
 pub use chain::Chain;
 pub use config::{ChainBuilder, ChainConfig, PluginBuilder, PluginConfig};
 pub use error::Error;
+pub use lilv::World;
 pub use midi::{MidiEvent, MidiSender};
+pub use plugin::ControlPortMeta;
+
+#[cfg(feature = "ui")]
+pub fn ui_shutdown() {
+    ui::ui_shutdown();
+}

@@ -10,7 +10,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["ui"]
-ui = ["dep:gtk", "dep:glib", "dep:gdk"]
+ui = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -21,9 +21,6 @@ jack = "0.13"
 rtrb = "0.3"
 lilv = "0.2"
 lv2_raw = "0.2"
-gtk = { version = "0.18", optional = true }
-glib = { version = "0.18", optional = true }
-gdk = { version = "0.18", optional = true }
 
 [build-dependencies]
 pkg-config = "0.3"

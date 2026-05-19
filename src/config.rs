@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 /// Top-level configuration for a plugin chain.
 #[derive(Debug, Clone)]
 pub struct ChainConfig {
@@ -16,12 +14,13 @@ pub struct ChainConfig {
 pub struct PluginConfig {
     pub uri: String,
     pub name: String,
-    pub controls: HashMap<String, f32>,
-    pub show_ui: bool,
+    pub generic_ui: bool,
     /// Override MIDI input detection. When `Some(true)`, the chain always
     /// creates a MIDI route to this plugin. When `Some(false)`, never.
     /// When `None`, auto-detects via JACK port types.
     pub midi_in: Option<bool>,
+    pub dual_mono: bool,
+    pub stereo_mix: Option<Vec<[f32; 2]>>,
 }
 
 pub struct ChainBuilder {
@@ -85,9 +84,10 @@ impl ChainBuilder {
 pub struct PluginBuilder {
     uri: String,
     name: String,
-    controls: HashMap<String, f32>,
-    show_ui: bool,
+    generic_ui: bool,
     midi_in: Option<bool>,
+    dual_mono: bool,
+    stereo_mix: Option<Vec<[f32; 2]>>,
 }
 
 impl PluginBuilder {
@@ -95,19 +95,15 @@ impl PluginBuilder {
         Self {
             uri: uri.into(),
             name: name.into(),
-            controls: HashMap::new(),
-            show_ui: true,
+            generic_ui: false,
             midi_in: None,
+            dual_mono: false,
+            stereo_mix: None,
         }
     }
 
-    pub fn control(mut self, symbol: impl Into<String>, value: f32) -> Self {
-        self.controls.insert(symbol.into(), value);
-        self
-    }
-
-    pub fn hide_ui(mut self) -> Self {
-        self.show_ui = false;
+    pub fn generic_ui(mut self) -> Self {
+        self.generic_ui = true;
         self
     }
 
@@ -116,13 +112,24 @@ impl PluginBuilder {
         self
     }
 
+    pub fn dual_mono(mut self) -> Self {
+        self.dual_mono = true;
+        self
+    }
+
+    pub fn stereo_mix(mut self, mix: Vec<[f32; 2]>) -> Self {
+        self.stereo_mix = Some(mix);
+        self
+    }
+
     pub fn build(self) -> PluginConfig {
         PluginConfig {
             uri: self.uri,
             name: self.name,
-            controls: self.controls,
-            show_ui: self.show_ui,
+            generic_ui: self.generic_ui,
             midi_in: self.midi_in,
+            dual_mono: self.dual_mono,
+            stereo_mix: self.stereo_mix,
         }
     }
 }
@@ -165,34 +172,16 @@ mod tests {
         let plugin = PluginBuilder::new("urn:test", "comp").build();
         assert_eq!(plugin.uri, "urn:test");
         assert_eq!(plugin.name, "comp");
-        assert!(plugin.show_ui);
         assert!(plugin.midi_in.is_none());
-        assert!(plugin.controls.is_empty());
     }
 
     #[test]
     fn plugin_builder_all_options() {
         let plugin = PluginBuilder::new("urn:synth", "synth1")
-            .hide_ui()
             .midi_in(true)
-            .control("gain", 0.75)
-            .control("freq", 440.0)
             .build();
 
-        assert!(!plugin.show_ui);
         assert_eq!(plugin.midi_in, Some(true));
-        assert_eq!(plugin.controls.len(), 2);
-        assert!((plugin.controls["gain"] - 0.75).abs() < f32::EPSILON);
-        assert!((plugin.controls["freq"] - 440.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn plugin_builder_control_override() {
-        let plugin = PluginBuilder::new("urn:test", "p")
-            .control("gain", 0.5)
-            .control("gain", 0.9)
-            .build();
-        assert!((plugin.controls["gain"] - 0.9).abs() < f32::EPSILON);
     }
 
     #[test]

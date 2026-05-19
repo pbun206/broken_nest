@@ -38,6 +38,15 @@ struct PortInfo {
     has_midi: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct ControlPortMeta {
+    pub symbol: String,
+    pub port_index: u32,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+}
+
 #[repr(C)]
 struct LV2WorkerInterface {
     work: Option<
@@ -68,6 +77,7 @@ unsafe impl Send for PluginWorker {}
 pub struct Lv2PluginInstance {
     pub name: String,
     pub uri: String,
+    worker: Option<PluginWorker>,
     instance: lilv::instance::ActiveInstance,
     port_infos: Vec<PortInfo>,
     control_in_symbol_map: HashMap<String, usize>,
@@ -78,12 +88,14 @@ pub struct Lv2PluginInstance {
     atom_in_bufs: Vec<Box<[u8]>>,
     atom_out_bufs: Vec<Box<[u8]>>,
     _dummy_buf: Box<[u8]>,
-    worker: Option<PluginWorker>,
     _worker_schedule: Option<Box<LV2WorkerSchedule>>,
     _worker_schedule_uri: Option<CString>,
     atom_sequence_urid: u32,
     midi_event_urid: u32,
     midi_in_buf_indices: Vec<usize>,
+    instance_handle: *mut c_void,
+    state_iface: Option<*const crate::state::LV2StateInterface>,
+    control_port_meta: Vec<ControlPortMeta>,
 }
 
 unsafe impl Send for Lv2PluginInstance {}
@@ -96,6 +108,7 @@ impl Lv2PluginInstance {
         sample_rate: f64,
         buffer_size: u32,
         feature_set: &FeatureSet,
+        state_dir: Option<&std::path::Path>,
     ) -> Result<Self, Error> {
         let uri_node = world.new_uri(plugin_uri);
         let plugin = world
@@ -318,14 +331,17 @@ impl Lv2PluginInstance {
                                     features::read_framed_message(&mut rx)
                                 {
                                     let tx_ref = &tx_mutex;
-                                    unsafe {
+                                    let status = unsafe {
                                         work_fn(
                                             handle,
                                             features::worker_respond_callback,
                                             tx_ref as *const _ as *mut c_void,
                                             size,
                                             data.as_ptr() as *const c_void,
-                                        );
+                                        )
+                                    };
+                                    if status != 0 {
+                                        log::warn!("[worker] work() returned {status} for size={size}");
                                     }
                                 } else {
                                     std::thread::sleep(std::time::Duration::from_millis(1));
@@ -404,7 +420,38 @@ impl Lv2PluginInstance {
             }
         }
 
+        let state_iface = crate::state::get_state_interface(&instance);
+        let instance_handle = instance.handle();
+
+        let control_port_meta: Vec<ControlPortMeta> = port_infos
+            .iter()
+            .filter(|p| p.kind == PortKind::ControlIn)
+            .map(|p| {
+                let r = &ranges[p.port_index];
+                ControlPortMeta {
+                    symbol: p.symbol.clone(),
+                    port_index: p.port_index as u32,
+                    min: if r.min.is_finite() { r.min } else { 0.0 },
+                    max: if r.max.is_finite() { r.max } else { 1.0 },
+                    default: if r.default.is_finite() { r.default } else { 0.0 },
+                }
+            })
+            .collect();
+
         let active_instance = unsafe { instance.activate() };
+
+        if let (Some(iface_ptr), Some(dir)) = (state_iface, state_dir) {
+            let iface = unsafe { &*iface_ptr };
+            let features_ptr = feature_set.as_feature_ptrs();
+            crate::state::restore_plugin_state(
+                iface,
+                instance_handle,
+                &feature_set.mapper,
+                features_ptr,
+                dir,
+                name,
+            );
+        }
 
         log::info!(
             "plugin '{name}' ({plugin_uri}): {audio_in_count} audio in, {audio_out_count} audio out, \
@@ -433,6 +480,9 @@ impl Lv2PluginInstance {
             atom_sequence_urid,
             midi_event_urid,
             midi_in_buf_indices,
+            instance_handle,
+            state_iface,
+            control_port_meta,
         })
     }
 
@@ -444,6 +494,14 @@ impl Lv2PluginInstance {
     }
     pub fn has_midi_in(&self) -> bool {
         !self.midi_in_buf_indices.is_empty()
+    }
+
+    pub fn instance_handle(&self) -> *mut c_void {
+        self.instance_handle
+    }
+
+    pub fn state_interface(&self) -> Option<*const crate::state::LV2StateInterface> {
+        self.state_iface
     }
 
     pub fn audio_in_bufs_mut(&mut self) -> &mut [Box<[f32]>] {
@@ -495,6 +553,10 @@ impl Lv2PluginInstance {
             .collect()
     }
 
+    pub fn control_port_meta(&self) -> &[ControlPortMeta] {
+        &self.control_port_meta
+    }
+
     pub fn control_in_port_indices(&self) -> Vec<u32> {
         self.port_infos
             .iter()
@@ -508,8 +570,48 @@ impl Lv2PluginInstance {
             write_empty_atom_sequence(buf, self.atom_sequence_urid);
         }
         for buf in &mut self.atom_out_bufs {
-            write_empty_atom_sequence(buf, self.atom_sequence_urid);
+            write_atom_out_capacity(buf, self.atom_sequence_urid);
         }
+    }
+
+    pub fn write_atom_to_port(&mut self, port_index: usize, protocol: u32, data: &[u8]) {
+        for info in &self.port_infos {
+            if info.port_index == port_index && info.kind == PortKind::AtomIn {
+                let buf = &mut self.atom_in_bufs[info.buf_index];
+                let seq_urid = self.atom_sequence_urid;
+                append_atom_event(buf, seq_urid, protocol, data);
+                return;
+            }
+        }
+    }
+
+    pub fn drain_atom_output_events(&self) -> Vec<(usize, Vec<u8>)> {
+        let mut result = Vec::new();
+        for info in &self.port_infos {
+            if info.kind == PortKind::AtomOut {
+                let buf = &self.atom_out_bufs[info.buf_index];
+                if buf.len() < 16 {
+                    continue;
+                }
+                let body_size = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if body_size <= 8 {
+                    continue;
+                }
+                log::debug!("[atom_out] plugin='{}' port={} body_size={}", self.name, info.port_index, body_size);
+                let mut pos = 16;
+                while pos + 8 < 8 + body_size {
+                    let _time = i64::from_ne_bytes(buf[pos..pos + 8].try_into().unwrap());
+                    let atom_size = u32::from_ne_bytes(buf[pos + 8..pos + 12].try_into().unwrap()) as usize;
+                    let atom_total = 8 + atom_size;
+                    if pos + 8 + atom_total > buf.len() {
+                        break;
+                    }
+                    result.push((info.port_index, buf[pos + 8..pos + 8 + atom_total].to_vec()));
+                    pos += 8 + ((atom_total + 7) & !7);
+                }
+            }
+        }
+        result
     }
 
     pub fn write_midi_to_atom_in(&mut self, events: &[(i64, &[u8])]) {
@@ -527,6 +629,28 @@ impl Lv2PluginInstance {
     }
 
     pub fn run(&mut self, nframes: u32) {
+        for info in &self.port_infos {
+            if info.kind == PortKind::AtomIn {
+                let buf = &self.atom_in_bufs[info.buf_index];
+                let body_size = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if body_size > 8 {
+                    log::debug!("[pre_run] plugin='{}' port={} atom_in body_size={}", self.name, info.port_index, body_size);
+                }
+            }
+        }
+        if self.name == "nam" {
+            static RUN_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let c = RUN_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if c == 0 {
+                log::debug!("[run] plugin='{}' instance_handle={:?}", self.name, self.instance_handle);
+            }
+            if c % 200 == 0 {
+                // NAM::Plugin layout: Ports(48) + sampleRate(8) + map(8) + logger(32) + schedule(8) = offset 104
+                let ptr = unsafe { (self.instance_handle as *const u8).add(104) };
+                let model_ptr = unsafe { *(ptr as *const u64) };
+                log::debug!("[nam_model] cycle={c} currentModel=0x{model_ptr:016X}");
+            }
+        }
         unsafe {
             self.instance.run(nframes as usize);
         }
@@ -534,12 +658,18 @@ impl Lv2PluginInstance {
             while let Some((size, data)) =
                 features::read_framed_message(&mut worker.response_rx)
             {
+                log::debug!("[work_response] plugin='{}' size={size} handle={:?} first_4={:?} last_8={:?}", self.name, worker.instance_handle, &data[..4.min(data.len())], &data[data.len().saturating_sub(8)..]);
                 unsafe {
                     (worker.work_response_fn)(
                         worker.instance_handle,
                         size,
                         data.as_ptr() as *const c_void,
                     );
+                }
+                if self.name == "nam" {
+                    let ptr = unsafe { (worker.instance_handle as *const u8).add(104) };
+                    let model_ptr = unsafe { *(ptr as *const u64) };
+                    log::debug!("[nam_after_work_response] currentModel=0x{model_ptr:016X}");
                 }
             }
             if let Some(end_run) = worker.end_run_fn {
@@ -569,12 +699,44 @@ unsafe extern "C" fn schedule_work_callback(
         let tx_cell = &*(handle as *const UnsafeCell<rtrb::Producer<u8>>);
         let tx = &mut *tx_cell.get();
         let bytes = std::slice::from_raw_parts(data as *const u8, size as usize);
+        log::debug!("[schedule_work] size={size}");
         if features::write_framed_message(tx, size, bytes) {
             0
         } else {
+            log::warn!("[schedule_work] ring buffer full, dropped work");
             1
         }
     }
+}
+
+fn append_atom_event(buf: &mut [u8], sequence_urid: u32, _protocol: u32, atom_data: &[u8]) {
+    if buf.len() < 16 || atom_data.len() < 8 {
+        return;
+    }
+    // Read current sequence body size from atom header
+    let body_size = u32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    // Events start after 16-byte header (8 atom + 8 seq body)
+    let offset = 8 + body_size;
+    // Event: 8 bytes time (0) + atom_data (which is LV2_Atom: size+type+body)
+    let event_size = 8 + atom_data.len();
+    let padded = (event_size + 7) & !7;
+    if offset + padded > buf.len() {
+        return;
+    }
+    // time.frames = 0
+    buf[offset..offset + 8].copy_from_slice(&0i64.to_ne_bytes());
+    // atom (size + type + body)
+    buf[offset + 8..offset + 8 + atom_data.len()].copy_from_slice(atom_data);
+    // pad
+    let end = offset + 8 + atom_data.len();
+    let aligned = (end + 7) & !7;
+    if aligned > end {
+        buf[end..aligned].fill(0);
+    }
+    // Update atom header size
+    let new_body_size = (body_size + padded) as u32;
+    buf[0..4].copy_from_slice(&new_body_size.to_ne_bytes());
+    buf[4..8].copy_from_slice(&sequence_urid.to_ne_bytes());
 }
 
 fn write_empty_atom_sequence(buf: &mut [u8], sequence_urid: u32) {
@@ -582,6 +744,17 @@ fn write_empty_atom_sequence(buf: &mut [u8], sequence_urid: u32) {
         return;
     }
     buf[0..4].copy_from_slice(&8u32.to_ne_bytes());
+    buf[4..8].copy_from_slice(&sequence_urid.to_ne_bytes());
+    buf[8..16].fill(0);
+}
+
+fn write_atom_out_capacity(buf: &mut [u8], sequence_urid: u32) {
+    if buf.len() < 16 {
+        return;
+    }
+    // LV2 spec: for output atom ports, atom.size = available buffer capacity (excluding atom header)
+    let capacity = (buf.len() - 8) as u32;
+    buf[0..4].copy_from_slice(&capacity.to_ne_bytes());
     buf[4..8].copy_from_slice(&sequence_urid.to_ne_bytes());
     buf[8..16].fill(0);
 }
@@ -694,7 +867,7 @@ mod tests {
         }
 
         let features = FeatureSet::new(48000.0, 1024);
-        let inst = Lv2PluginInstance::new(&world, uri, "test-amp", 48000.0, 1024, &features);
+        let inst = Lv2PluginInstance::new(&world, uri, "test-amp", 48000.0, 1024, &features, None);
         let inst = inst.expect("failed to instantiate eg-amp");
 
         assert_eq!(inst.audio_in_count(), 1);
